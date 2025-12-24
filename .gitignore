@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+.env
+backend/app/data/
