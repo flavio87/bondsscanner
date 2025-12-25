@@ -202,16 +202,31 @@ button.ghost {
   margin-bottom: 48px;
 }
 
-.summary-grid {
+.summary-groups {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
   margin-bottom: 18px;
+}
+
+.summary-group {
   background: #fff;
   border-radius: 16px;
   border: 1px solid var(--border);
   padding: 16px;
   box-shadow: var(--shadow);
+}
+
+.summary-group h4 {
+  margin: 0 0 10px;
+  font-family: "Fraunces", serif;
+  font-size: 1rem;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
 }
 
 .basis-toggle {
@@ -245,6 +260,16 @@ button.ghost {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.metric-label-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06rem;
+  color: #6c6c6c;
 }
 
 .info-tooltip {
@@ -429,6 +454,50 @@ button.ghost {
   min-width: 900px;
 }
 
+.results-table table {
+  min-width: 0;
+  table-layout: auto;
+}
+
+.results-table th,
+.results-table td {
+  padding: 10px 8px;
+  font-size: 0.82rem;
+}
+
+.results-table th:not(:nth-child(1)):not(:nth-child(5)),
+.results-table td:not(:nth-child(1)):not(:nth-child(5)) {
+  white-space: nowrap;
+}
+
+.results-table th.rating-col,
+.results-table td.rating-col {
+  max-width: 110px;
+  width: 110px;
+}
+
+.results-table th:nth-child(1),
+.results-table td:nth-child(1),
+.results-table th:nth-child(5),
+.results-table td:nth-child(5) {
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: anywhere;
+  min-width: 180px;
+  max-width: 240px;
+}
+
+.term-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.term-stack-sub {
+  font-size: 0.72rem;
+  color: #6c6258;
+}
+
 th,
 td {
   padding: 12px 14px;
@@ -528,6 +597,136 @@ tr:hover td {
   display: block;
   font-weight: 600;
   margin-top: 4px;
+}
+
+.enrichment-card {
+  border: 1px dashed #e2d8c9;
+  background: #fff8ef;
+  border-radius: 14px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.enrichment-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.enrichment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.enrichment-list {
+  margin-top: 8px;
+}
+
+.detail-list .detail-subtext {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.78rem;
+  color: #6f6f6f;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.rating-stack {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.rating-stack > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.9rem;
+}
+
+.rating-stack strong {
+  font-weight: 600;
+  display: inline;
+  margin-top: 0;
+}
+
+.detail-list .rating-value {
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.rating-item {
+  position: relative;
+}
+
+.rating-button {
+  background: transparent;
+  border: 1px solid #d6c2ab;
+  border-radius: 10px;
+  padding: 4px 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: #2c2c2c;
+}
+
+.rating-button:hover {
+  border-color: #b89a77;
+}
+
+.rating-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  background: #1f1f1f;
+  color: #fff;
+  padding: 10px 12px;
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  width: 220px;
+  z-index: 20;
+}
+
+.rating-popover p {
+  margin: 0 0 6px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08rem;
+  color: #d7c2a4;
+}
+
+.rating-sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  font-size: 0.78rem;
+}
+
+.rating-sources a {
+  color: #f5d6a5;
+  text-decoration: none;
+}
+
+.rating-sources a:hover {
+  text-decoration: underline;
+}
+
+.rating-empty {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #c9c9c9;
+}
+
+.enrichment-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .link {
@@ -630,6 +829,13 @@ tr:hover td {
 .schedule-table th {
   background: #f7efe4;
   font-weight: 600;
+}
+
+.schedule-sources {
+  display: inline-block;
+  max-width: 280px;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .portfolio-schedule h3 {

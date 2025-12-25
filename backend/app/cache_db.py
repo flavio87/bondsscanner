@@ -25,9 +25,13 @@ def init_db() -> None:
                 issuer_name TEXT PRIMARY KEY,
                 summary_md TEXT,
                 moodys TEXT,
+                fitch TEXT,
                 sp TEXT,
                 vegan_score REAL,
+                vegan_friendly INTEGER,
+                vegan_explanation TEXT,
                 esg_summary TEXT,
+                sources_json TEXT,
                 source TEXT,
                 model TEXT,
                 updated_at INTEGER,
@@ -50,6 +54,26 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_columns(
+            conn,
+            "issuer_enrichment",
+            [
+                ("fitch", "TEXT"),
+                ("vegan_friendly", "INTEGER"),
+                ("vegan_explanation", "TEXT"),
+                ("sources_json", "TEXT"),
+            ],
+        )
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    for name, col_type in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
 
 
 def _now_ts() -> int:
@@ -65,6 +89,13 @@ def get_issuer_enrichment(issuer_name: str, include_expired: bool = False) -> Op
     if not row:
         return None
     data = dict(row)
+    sources_raw = data.get("sources_json")
+    if sources_raw:
+        try:
+            data["sources"] = json.loads(sources_raw)
+        except json.JSONDecodeError:
+            data["sources"] = sources_raw
+    data.pop("sources_json", None)
     if data.get("pinned"):
         return data
     expires_at = data.get("expires_at") or 0
@@ -73,14 +104,50 @@ def get_issuer_enrichment(issuer_name: str, include_expired: bool = False) -> Op
     return data
 
 
+def get_issuer_enrichments(
+    issuer_names: list[str],
+    include_expired: bool = False,
+) -> dict[str, dict]:
+    names = [name for name in issuer_names if name]
+    if not names:
+        return {}
+    placeholders = ",".join("?" for _ in names)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM issuer_enrichment WHERE issuer_name IN ({placeholders})",
+            names,
+        ).fetchall()
+    results: dict[str, dict] = {}
+    now = _now_ts()
+    for row in rows:
+        data = dict(row)
+        sources_raw = data.get("sources_json")
+        if sources_raw:
+            try:
+                data["sources"] = json.loads(sources_raw)
+            except json.JSONDecodeError:
+                data["sources"] = sources_raw
+        data.pop("sources_json", None)
+        if not data.get("pinned"):
+            expires_at = data.get("expires_at") or 0
+            if not include_expired and expires_at and expires_at < now:
+                continue
+        results[data.get("issuer_name")] = data
+    return results
+
+
 def upsert_issuer_enrichment(
     *,
     issuer_name: str,
     summary_md: Optional[str],
     moodys: Optional[str],
+    fitch: Optional[str],
     sp: Optional[str],
     vegan_score: Optional[float],
+    vegan_friendly: Optional[bool],
+    vegan_explanation: Optional[str],
     esg_summary: Optional[str],
+    sources: Optional[list[str]],
     source: str,
     model: Optional[str],
     ttl_seconds: int,
@@ -95,22 +162,30 @@ def upsert_issuer_enrichment(
                 issuer_name,
                 summary_md,
                 moodys,
+                fitch,
                 sp,
                 vegan_score,
+                vegan_friendly,
+                vegan_explanation,
                 esg_summary,
+                sources_json,
                 source,
                 model,
                 updated_at,
                 expires_at,
                 pinned
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(issuer_name) DO UPDATE SET
                 summary_md=excluded.summary_md,
                 moodys=excluded.moodys,
+                fitch=excluded.fitch,
                 sp=excluded.sp,
                 vegan_score=excluded.vegan_score,
+                vegan_friendly=excluded.vegan_friendly,
+                vegan_explanation=excluded.vegan_explanation,
                 esg_summary=excluded.esg_summary,
+                sources_json=excluded.sources_json,
                 source=excluded.source,
                 model=excluded.model,
                 updated_at=excluded.updated_at,
@@ -121,9 +196,13 @@ def upsert_issuer_enrichment(
                 issuer_name,
                 summary_md,
                 moodys,
+                fitch,
                 sp,
                 vegan_score,
+                1 if vegan_friendly else 0 if vegan_friendly is not None else None,
+                vegan_explanation,
                 esg_summary,
+                json.dumps(sources) if sources is not None else None,
                 source,
                 model,
                 now,
@@ -160,6 +239,27 @@ def fetch_next_job() -> Optional[dict]:
             ("running", _now_ts(), job_id),
         )
     return dict(row)
+
+
+def cleanup_stale_jobs(stale_seconds: int, *, action: str = "fail") -> int:
+    if stale_seconds <= 0:
+        return 0
+    now = _now_ts()
+    cutoff = now - stale_seconds
+    if action not in {"fail", "requeue"}:
+        action = "fail"
+    status = "queued" if action == "requeue" else "failed"
+    error = None if action == "requeue" else f"stale job (> {stale_seconds}s)"
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE llm_jobs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE status = 'running' AND updated_at < ?
+            """,
+            (status, error, now, cutoff),
+        )
+    return cursor.rowcount
 
 
 def update_job_status(

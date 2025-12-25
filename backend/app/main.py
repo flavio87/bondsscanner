@@ -3,8 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-from .cache_db import get_issuer_enrichment, init_db, upsert_issuer_enrichment, enqueue_job
+from .cache_db import (
+    cleanup_stale_jobs,
+    enqueue_job,
+    get_issuer_enrichment,
+    get_issuer_enrichments,
+    init_db,
+    upsert_issuer_enrichment,
+)
 from .llm_queue import get_job_status, start_worker
+from .llm_client import LlmClientError, call_llm, extract_json
 from .settings import load_env
 from .cache import TTLCache
 from .six_client import (
@@ -57,6 +65,29 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/llm/validate")
+def llm_validate(model: Optional[str] = None) -> dict:
+    prompt = 'Return JSON: {"ok": true, "source": "validate"}'
+    try:
+        response = call_llm(prompt, model=model)
+    except LlmClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        content = response["text"]
+        parsed = extract_json(content)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response parse failed: {exc}",
+        ) from exc
+    return {
+        "status": "ok",
+        "response": parsed,
+        "model": response.get("model"),
+        "provider": response.get("provider"),
+    }
+
+
 @app.get("/api/snb/curve")
 def snb_curve() -> dict:
     try:
@@ -73,19 +104,38 @@ class IssuerEnrichmentRequest(BaseModel):
     pinned: bool = False
     ttl_seconds: int = 30 * 24 * 60 * 60
     model: Optional[str] = None
+    ratings_use_web: bool = True
+    ratings_web_max_results: int = 5
+    ratings_web_engine: Optional[str] = None
+    ratings_web_search_prompt: Optional[str] = None
+    ratings_web_search_options: Optional[dict] = None
 
 
 class IssuerEnrichmentOverride(BaseModel):
     issuer_name: str
     summary_md: Optional[str] = None
     moodys: Optional[str] = None
+    fitch: Optional[str] = None
     sp: Optional[str] = None
     vegan_score: Optional[float] = None
+    vegan_friendly: Optional[bool] = None
+    vegan_explanation: Optional[str] = None
     esg_summary: Optional[str] = None
+    sources: Optional[list[str]] = None
     pinned: bool = True
     ttl_seconds: int = 30 * 24 * 60 * 60
     source: str = "manual"
     model: Optional[str] = None
+
+
+class IssuerEnrichmentBatchRequest(BaseModel):
+    issuers: list[str]
+    include_expired: bool = False
+
+
+class JobCleanupRequest(BaseModel):
+    stale_seconds: int = 900
+    action: str = "fail"
 
 
 @app.get("/api/issuer/enrichment/{issuer_name}")
@@ -94,6 +144,18 @@ def issuer_enrichment(issuer_name: str, include_expired: bool = False) -> dict:
     if not data:
         raise HTTPException(status_code=404, detail="Issuer enrichment not found")
     return data
+
+
+@app.post("/api/issuer/enrichment/batch")
+def issuer_enrichment_batch(request: IssuerEnrichmentBatchRequest) -> dict:
+    items = get_issuer_enrichments(request.issuers, include_expired=request.include_expired)
+    return {"items": items}
+
+
+@app.post("/api/issuer/enrichment/jobs/cleanup")
+def issuer_enrichment_job_cleanup(request: JobCleanupRequest) -> dict:
+    cleaned = cleanup_stale_jobs(request.stale_seconds, action=request.action)
+    return {"status": "ok", "cleaned": cleaned}
 
 
 @app.post("/api/issuer/enrichment")
@@ -110,6 +172,11 @@ def enqueue_issuer_enrichment(request: IssuerEnrichmentRequest) -> dict:
             "pinned": request.pinned,
             "ttl_seconds": request.ttl_seconds,
             "model": request.model,
+            "ratings_use_web": request.ratings_use_web,
+            "ratings_web_max_results": request.ratings_web_max_results,
+            "ratings_web_engine": request.ratings_web_engine,
+            "ratings_web_search_prompt": request.ratings_web_search_prompt,
+            "ratings_web_search_options": request.ratings_web_search_options,
         },
     )
     return {"status": "queued", "job_id": job_id}
@@ -121,9 +188,13 @@ def override_issuer_enrichment(payload: IssuerEnrichmentOverride) -> dict:
         issuer_name=payload.issuer_name,
         summary_md=payload.summary_md,
         moodys=payload.moodys,
+        fitch=payload.fitch,
         sp=payload.sp,
         vegan_score=payload.vegan_score,
+        vegan_friendly=payload.vegan_friendly,
+        vegan_explanation=payload.vegan_explanation,
         esg_summary=payload.esg_summary,
+        sources=payload.sources,
         source=payload.source,
         model=payload.model,
         ttl_seconds=payload.ttl_seconds,
@@ -154,22 +225,35 @@ def bond_volumes(ids: str = Query("", description="Comma-separated ValorIds")) -
             items[valor_id] = cached
             continue
         try:
-            liquidity = fetch_bond_liquidity(valor_id)
+            market = fetch_bond_market_data(valor_id)
         except SixClientError:
-            liquidity = []
-        if liquidity:
-            latest = max(
-                liquidity,
-                key=lambda row: parse_number(row.get("tradingDate")) or 0,
-            )
-            buy_volume = parse_number(latest.get("avgBuyVolume")) or 0
-            sell_volume = parse_number(latest.get("avgSellVolume")) or 0
-            volume = buy_volume + sell_volume or None
-            volume_date = latest.get("tradingDate")
-        else:
-            volume = None
-            volume_date = None
-        payload = {"volume": volume, "date": volume_date}
+            market = {}
+
+        total_volume = parse_number(market.get("TotalVolume"))
+        on_volume = parse_number(market.get("OnMarketVolume"))
+        off_volume = parse_number(market.get("OffBookVolume"))
+        latest_trade_volume = parse_number(market.get("LatestTradeVolume"))
+
+        volume = None
+        source = None
+        if total_volume is not None:
+            volume = total_volume
+            source = "total_volume"
+        elif on_volume is not None or off_volume is not None:
+            volume = (on_volume or 0) + (off_volume or 0)
+            source = "on_off_volume"
+        elif latest_trade_volume is not None:
+            volume = latest_trade_volume
+            source = "latest_trade_volume"
+
+        volume_date = market.get("LatestTradeDate") or market.get("MarketDate")
+        payload = {
+            "volume": volume,
+            "date": volume_date,
+            "source": source,
+            "on_volume": on_volume,
+            "off_volume": off_volume,
+        }
         VOLUME_CACHE.set(valor_id, payload)
         items[valor_id] = payload
     return {"items": items}

@@ -1,6 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchBondDetails, fetchBondVolumes, fetchBonds, fetchSnbCurve } from "./api.js";
+import {
+  enrichIssuer,
+  fetchBondDetails,
+  fetchBondVolumes,
+  fetchBonds,
+  fetchIssuerEnrichment,
+  fetchIssuerEnrichmentBatch,
+  fetchIssuerEnrichmentJob,
+  fetchSnbCurve
+} from "./api.js";
 import {
   buildCashflows,
   computeScenario,
@@ -28,6 +37,9 @@ const MATURITY_OPTIONS = [
 const CURRENCY_OPTIONS = ["CHF", "EUR", "USD", "GBP", "JPY"];
 const SIX_DETAIL_BASE =
   "https://www.six-group.com/de/market-data/bonds/bond-explorer/bond-details.html";
+const LIQUIDITY_SPREAD_DAYS = 5;
+const LLM_POLL_INTERVAL_MS = 1000;
+const LLM_MAX_ATTEMPTS = 120;
 
 function maturityYearsFromValue(value) {
   if (!value) return null;
@@ -61,6 +73,220 @@ function buildSixDetailUrl(valorId) {
     return `${parts.join(".")}.${valorId}.${ext}`;
   }
   return `${SIX_DETAIL_BASE}.${valorId}`;
+}
+
+function formatVeganFriendly(value) {
+  if (value === true || value === 1) return "Yes";
+  if (value === false || value === 0) return "No";
+  return "-";
+}
+
+function buildIssuerContext(detail, selected) {
+  if (!detail && !selected) return "";
+  const overview = detail?.overview || {};
+  const details = detail?.details || {};
+  const issuer = overview.issuerName || selected?.IssuerNameFull || "Unknown issuer";
+  const country = details.issuerCountryCode || selected?.IssuerCountry || "";
+  const currency = details.issueCurrency || selected?.Currency || "";
+  const maturity =
+    details.maturity || overview.maturityDate || selected?.MaturityDate || "";
+  return [
+    `Issuer: ${issuer}`,
+    country ? `Issuer country: ${country}` : null,
+    currency ? `Issue currency: ${currency}` : null,
+    maturity ? `Maturity: ${maturity}` : null,
+    selected?.ShortName ? `Bond: ${selected.ShortName}` : null
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function normalizeSources(sources) {
+  if (!sources) return [];
+  if (Array.isArray(sources)) {
+    return sources.map((item) => String(item).trim()).filter(Boolean);
+  }
+  if (typeof sources === "string") {
+    return sources
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [String(sources)];
+}
+
+function formatSourceLabel(source) {
+  try {
+    const url = new URL(source);
+    return url.hostname;
+  } catch {
+    return source;
+  }
+}
+
+const MOODYS_RATING_SCALE = [
+  "Aaa",
+  "Aa1",
+  "Aa2",
+  "Aa3",
+  "A1",
+  "A2",
+  "A3",
+  "Baa1",
+  "Baa2",
+  "Baa3",
+  "Ba1",
+  "Ba2",
+  "Ba3",
+  "B1",
+  "B2",
+  "B3",
+  "Caa1",
+  "Caa2",
+  "Caa3",
+  "Ca",
+  "C"
+];
+
+const MOODYS_RATING_RANK = new Map(
+  MOODYS_RATING_SCALE.map((rating, index) => [rating.toLowerCase(), index + 1])
+);
+
+const SP_FITCH_RATING_SCALE = [
+  "AAA",
+  "AA+",
+  "AA",
+  "AA-",
+  "A+",
+  "A",
+  "A-",
+  "BBB+",
+  "BBB",
+  "BBB-",
+  "BB+",
+  "BB",
+  "BB-",
+  "B+",
+  "B",
+  "B-",
+  "CCC+",
+  "CCC",
+  "CCC-",
+  "CC",
+  "C",
+  "D"
+];
+
+const SP_FITCH_RATING_RANK = new Map(
+  SP_FITCH_RATING_SCALE.map((rating, index) => [rating.toLowerCase(), index + 1])
+);
+
+function normalizeMoodysRating(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (raw.toLowerCase() === "null") return null;
+  const token = raw.split(/\s|\/|,|\(|\)|;|:/)[0];
+  return token || null;
+}
+
+function moodysRatingRank(value) {
+  const normalized = normalizeMoodysRating(value);
+  if (!normalized) return null;
+  return MOODYS_RATING_RANK.get(normalized.toLowerCase()) ?? null;
+}
+
+function normalizeSpFitchRating(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (raw.toLowerCase() === "null") return null;
+  const match = raw.toUpperCase().match(
+    /\b(AAA|AA\+|AA-|AA|A\+|A-|A|BBB\+|BBB-|BBB|BB\+|BB-|BB|B\+|B-|B|CCC\+|CCC-|CCC|CC|C|D)\b/
+  );
+  return match ? match[1] : null;
+}
+
+function spFitchRatingRank(value) {
+  const normalized = normalizeSpFitchRating(value);
+  if (!normalized) return null;
+  return SP_FITCH_RATING_RANK.get(normalized.toLowerCase()) ?? null;
+}
+
+function computeLiquiditySpread(liquidity, market, ask, bid) {
+  const rows = Array.isArray(liquidity) ? liquidity : [];
+  const spreads = rows
+    .map((row) => {
+      const spread = parseNumber(row.avgSpread);
+      const date = parseDateValue(row.tradingDate);
+      return { spread, date };
+    })
+    .filter((row) => Number.isFinite(row.spread) && row.spread > 0)
+    .sort((a, b) => (b.date?.getTime() || 0) - (a.date?.getTime() || 0));
+
+  if (spreads.length > 0) {
+    const sample = spreads.slice(0, LIQUIDITY_SPREAD_DAYS);
+    const average =
+      sample.reduce((total, row) => total + row.spread, 0) / sample.length;
+    return {
+      spread: average,
+      source: `avg spread (last ${sample.length} days)`
+    };
+  }
+
+  const midSpread = parseNumber(market?.MidSpread);
+  if (Number.isFinite(midSpread) && midSpread > 0) {
+    return { spread: midSpread, source: "mid spread" };
+  }
+
+  if (Number.isFinite(ask) && Number.isFinite(bid) && ask > bid) {
+    return { spread: ask - bid, source: "ask-bid spread" };
+  }
+
+  return null;
+}
+
+function computeLiquidityHaircut(spread, price, notional) {
+  if (!Number.isFinite(spread) || spread <= 0) return null;
+  if (!Number.isFinite(price) || price <= 0) return null;
+  if (!Number.isFinite(notional) || notional <= 0) return null;
+  const halfSpread = spread / 2;
+  const haircutValue = (halfSpread / 100) * notional;
+  const haircutPct = halfSpread;
+  const estBid = price - halfSpread;
+  return {
+    halfSpread,
+    haircutValue,
+    haircutPct,
+    estBid
+  };
+}
+
+function formatLiquidityTooltip(meta) {
+  if (!meta) return "";
+  const {
+    source,
+    spread,
+    basePrice,
+    baseLabel,
+    estBid,
+    haircutPct,
+    haircutValue
+  } = meta;
+  return [
+    `Spread source: ${source || "unknown"}`,
+    Number.isFinite(spread) ? `Avg spread: ${formatNumber(spread, 3)}` : null,
+    baseLabel && Number.isFinite(basePrice)
+      ? `Base price (${baseLabel}): ${formatNumber(basePrice, 2)}`
+      : null,
+    Number.isFinite(estBid) ? `Est. bid price: ${formatNumber(estBid, 2)}` : null,
+    Number.isFinite(haircutPct) ? `Haircut: ${formatNumber(haircutPct, 3)}%` : null,
+    Number.isFinite(haircutValue)
+      ? `Haircut value (notional): ${formatCurrency(haircutValue, 0)}`
+      : null
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 const METRIC_TOOLTIPS = {
@@ -153,6 +379,32 @@ function MetricInline({ label, tooltip }) {
       <span>{label}</span>
       <InfoTooltip text={tooltip} />
     </span>
+  );
+}
+
+function SourcePopover({ sources }) {
+  const list = normalizeSources(sources);
+  if (list.length === 0) {
+    return <p className="rating-empty">No sources available.</p>;
+  }
+  return (
+    <ul className="rating-sources">
+      {list.map((source) => {
+        const label = formatSourceLabel(source);
+        const isUrl = /^https?:\/\//i.test(source);
+        return (
+          <li key={source}>
+            {isUrl ? (
+              <a href={source} target="_blank" rel="noopener noreferrer">
+                {label}
+              </a>
+            ) : (
+              <span>{label}</span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -589,10 +841,30 @@ export default function App() {
   const [portfolioPricingBasis, setPortfolioPricingBasis] = useState("last");
   const [portfolioScheduleView, setPortfolioScheduleView] = useState("aggregate");
 
+  const issuerNames = useMemo(() => {
+    const names = new Set();
+    bonds.forEach((bond) => {
+      if (bond?.IssuerNameFull) {
+        names.add(bond.IssuerNameFull);
+      }
+    });
+    return Array.from(names);
+  }, [bonds]);
+  const issuerNamesKey = issuerNames.join("|");
+
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const [issuerEnrichment, setIssuerEnrichment] = useState(null);
+  const [issuerEnrichmentStatus, setIssuerEnrichmentStatus] = useState({
+    state: "idle",
+    message: ""
+  });
+  const [issuerTableEnrichment, setIssuerTableEnrichment] = useState({});
+  const issuerEnrichmentRequestId = useRef(0);
+  const [ratingPopover, setRatingPopover] = useState(null);
+  const ratingContainerRef = useRef(null);
 
   const [notional, setNotional] = useState(100000);
   const [notionalInput, setNotionalInput] = useState("100000");
@@ -745,7 +1017,13 @@ export default function App() {
 
   useEffect(() => {
     if (bonds.length === 0) return;
-    const ids = bonds.map((bond) => bond.ValorId).filter(Boolean);
+    const ids = bonds
+      .filter((bond) => {
+        const totalVolume = parseNumber(bond.TotalVolume);
+        return !Number.isFinite(totalVolume) || totalVolume <= 0;
+      })
+      .map((bond) => bond.ValorId)
+      .filter(Boolean);
     const missing = ids.filter(
       (id) => !Object.prototype.hasOwnProperty.call(volumes, id)
     );
@@ -779,6 +1057,50 @@ export default function App() {
       active = false;
     };
   }, [bonds, volumes]);
+
+  useEffect(() => {
+    if (issuerNames.length === 0) return;
+    let active = true;
+
+    const loadIssuerEnrichment = async () => {
+      try {
+        const response = await fetchIssuerEnrichmentBatch(issuerNames);
+        if (!active) return;
+        const items = response.items || {};
+        setIssuerTableEnrichment((prev) => {
+          const next = { ...prev };
+          issuerNames.forEach((issuer) => {
+            const existing = prev[issuer];
+            const enrichment = items[issuer];
+            if (enrichment) {
+              next[issuer] = { status: "ready", enrichment };
+              return;
+            }
+            if (!existing || existing.status === "idle" || existing.status === "missing") {
+              next[issuer] = { status: "missing", enrichment: null };
+            }
+          });
+          return next;
+        });
+      } catch (err) {
+        if (!active) return;
+        setIssuerTableEnrichment((prev) => {
+          const next = { ...prev };
+          issuerNames.forEach((issuer) => {
+            if (!next[issuer]) {
+              next[issuer] = { status: "missing", enrichment: null };
+            }
+          });
+          return next;
+        });
+      }
+    };
+
+    loadIssuerEnrichment();
+    return () => {
+      active = false;
+    };
+  }, [issuerNamesKey]);
 
   useEffect(() => {
     handleSearch();
@@ -840,9 +1162,31 @@ export default function App() {
         case "GovSpreadBps":
           return parseNumber(bond.GovSpreadBps);
         case "DayVolume":
-          return parseNumber(volumes[bond.ValorId]?.volume);
+          {
+            const totalVolume = parseNumber(bond.TotalVolume);
+            if (Number.isFinite(totalVolume) && totalVolume > 0) {
+              return totalVolume;
+            }
+            const fallback = parseNumber(volumes[bond.ValorId]?.volume);
+            return Number.isFinite(fallback) ? fallback : totalVolume;
+          }
         case "AfterTaxYield":
           return parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+        case "MoodysRating": {
+          const issuerName = bond.IssuerNameFull || "";
+          const entry = issuerTableEnrichment[issuerName];
+          return moodysRatingRank(entry?.enrichment?.moodys);
+        }
+        case "FitchRating": {
+          const issuerName = bond.IssuerNameFull || "";
+          const entry = issuerTableEnrichment[issuerName];
+          return spFitchRatingRank(entry?.enrichment?.fitch);
+        }
+        case "SPRating": {
+          const issuerName = bond.IssuerNameFull || "";
+          const entry = issuerTableEnrichment[issuerName];
+          return spFitchRatingRank(entry?.enrichment?.sp);
+        }
         default:
           return bond[sortState.key];
       }
@@ -866,7 +1210,7 @@ export default function App() {
 
       return (Number(valueA) - Number(valueB)) * direction;
     });
-  }, [bonds, sortState, volumes, afterTaxYieldMap]);
+  }, [bonds, sortState, volumes, afterTaxYieldMap, issuerTableEnrichment]);
 
   const sortIndicator = (key) => {
     if (sortState.key !== key) return "";
@@ -874,6 +1218,10 @@ export default function App() {
   };
 
   const openDetails = async (bond) => {
+    issuerEnrichmentRequestId.current += 1;
+    setIssuerEnrichment(null);
+    setIssuerEnrichmentStatus({ state: "idle", message: "" });
+    setRatingPopover(null);
     setSelected(bond);
     setDetail(null);
     setDetailError("");
@@ -887,6 +1235,306 @@ export default function App() {
       setDetailLoading(false);
     }
   };
+
+  const pollIssuerEnrichment = async (jobId, issuerName, requestId, attempt = 0) => {
+    if (issuerEnrichmentRequestId.current !== requestId) return;
+    try {
+      const job = await fetchIssuerEnrichmentJob(jobId);
+      if (issuerEnrichmentRequestId.current !== requestId) return;
+      if (job?.status === "done") {
+        const enrichment = await fetchIssuerEnrichment(issuerName);
+        if (issuerEnrichmentRequestId.current !== requestId) return;
+        setIssuerEnrichment(enrichment);
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "ready", enrichment }
+        }));
+        setIssuerEnrichmentStatus({ state: "done", message: "" });
+        return;
+      }
+      if (job?.status === "failed") {
+        setIssuerEnrichmentStatus({
+          state: "failed",
+          message: job?.error || "Issuer enrichment failed."
+        });
+        return;
+      }
+      if (attempt >= LLM_MAX_ATTEMPTS) {
+        setIssuerEnrichmentStatus({
+          state: "queued",
+          message: "Still processing. You can refresh in a bit to check again."
+        });
+        return;
+      }
+      setTimeout(() => {
+        pollIssuerEnrichment(jobId, issuerName, requestId, attempt + 1);
+      }, LLM_POLL_INTERVAL_MS);
+    } catch (err) {
+      if (attempt >= LLM_MAX_ATTEMPTS) {
+        setIssuerEnrichmentStatus({
+          state: "queued",
+          message: "Still processing. You can refresh in a bit to check again."
+        });
+        return;
+      }
+      setTimeout(() => {
+        pollIssuerEnrichment(jobId, issuerName, requestId, attempt + 1);
+      }, LLM_POLL_INTERVAL_MS);
+    }
+  };
+
+  const pollIssuerTableEnrichment = async (jobId, issuerName, attempt = 0) => {
+    try {
+      const job = await fetchIssuerEnrichmentJob(jobId);
+      if (job?.status === "done") {
+        const enrichment = await fetchIssuerEnrichment(issuerName);
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "ready", enrichment }
+        }));
+        return;
+      }
+      if (job?.status === "failed") {
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: {
+            status: "error",
+            enrichment: prev[issuerName]?.enrichment || null
+          }
+        }));
+        return;
+      }
+      if (attempt >= LLM_MAX_ATTEMPTS) {
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: {
+            status: "queued",
+            enrichment: prev[issuerName]?.enrichment || null
+          }
+        }));
+        return;
+      }
+      setTimeout(() => {
+        pollIssuerTableEnrichment(jobId, issuerName, attempt + 1);
+      }, LLM_POLL_INTERVAL_MS);
+    } catch (err) {
+      if (attempt >= LLM_MAX_ATTEMPTS) {
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: {
+            status: "queued",
+            enrichment: prev[issuerName]?.enrichment || null
+          }
+        }));
+        return;
+      }
+      setTimeout(() => {
+        pollIssuerTableEnrichment(jobId, issuerName, attempt + 1);
+      }, LLM_POLL_INTERVAL_MS);
+    }
+  };
+
+  const handleFetchIssuerRatings = async (issuerName) => {
+    if (!issuerName) return;
+    setIssuerTableEnrichment((prev) => ({
+      ...prev,
+      [issuerName]: { status: "loading", enrichment: prev[issuerName]?.enrichment || null }
+    }));
+    try {
+      const response = await enrichIssuer({
+        issuer_name: issuerName,
+        force_refresh: true,
+        ratings_use_web: true,
+        ratings_web_max_results: 5,
+        ratings_web_search_options: { search_context_size: "high" }
+      });
+      if (response?.status === "cached" && response.enrichment) {
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "ready", enrichment: response.enrichment }
+        }));
+        return;
+      }
+      if (response?.status === "queued" && response.job_id) {
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "queued", enrichment: prev[issuerName]?.enrichment || null }
+        }));
+        pollIssuerTableEnrichment(response.job_id, issuerName);
+        return;
+      }
+      setIssuerTableEnrichment((prev) => ({
+        ...prev,
+        [issuerName]: { status: "error", enrichment: prev[issuerName]?.enrichment || null }
+      }));
+    } catch (err) {
+      setIssuerTableEnrichment((prev) => ({
+        ...prev,
+        [issuerName]: { status: "error", enrichment: prev[issuerName]?.enrichment || null }
+      }));
+    }
+  };
+
+  const buildIssuerPromptPreview = () => {
+    const issuerName = detail?.overview?.issuerName || selected?.IssuerNameFull || "";
+    const context = buildIssuerContext(detail, selected);
+    const profilePrompt = [
+      "You are enriching a bond issuer profile.",
+      "Return JSON with keys: summary_md, vegan_friendly, vegan_explanation, esg_summary.",
+      "Summary must be exactly one sentence.",
+      "vegan_friendly must be true/false, with a brief explanation in vegan_explanation.",
+      "Set vegan_friendly=false ONLY if there is clear evidence the issuer sells animal-derived products OR performs/commissions animal testing.",
+      "Otherwise set vegan_friendly=true (including industries like construction, software, finance).",
+      "If the context is insufficient, return null and state the uncertainty in vegan_explanation.",
+      "Only use the provided context; do not browse or guess.",
+      "",
+      `Issuer: ${issuerName || "Unknown issuer"}`,
+      "Context:",
+      context || "No extra context provided."
+    ].join("\n");
+
+    const ratingsPrompt = [
+      "What is the credit rating of the issuer below?",
+      "Show Moody's, Fitch, and S&P (whichever are available).",
+      "Use only the issuer's official website as a source.",
+      "Return JSON with keys: moodys, fitch, sp, sources.",
+      "If a rating is not available on the issuer website, return null for that rating.",
+      "Only use verifiable information; do not guess.",
+      "",
+      `Issuer: ${issuerName || "Unknown issuer"}`
+    ].join("\n");
+
+    return [
+      "Profile prompt:",
+      profilePrompt,
+      "",
+      "Ratings prompt (web-enabled):",
+      ratingsPrompt
+    ].join("\n");
+  };
+
+  const handleCopyPrompt = async () => {
+    const text = buildIssuerPromptPreview();
+    try {
+      await navigator.clipboard.writeText(text);
+      setIssuerEnrichmentStatus({
+        state: "done",
+        message: "Prompt copied to clipboard."
+      });
+    } catch (err) {
+      setIssuerEnrichmentStatus({
+        state: "failed",
+        message: err.message || "Failed to copy prompt."
+      });
+    }
+  };
+
+  const runIssuerEnrichment = async (forceRefresh) => {
+    if (!selected) return;
+    const issuerName = detail?.overview?.issuerName || selected?.IssuerNameFull || "";
+    if (!issuerName) {
+      setIssuerEnrichmentStatus({
+        state: "failed",
+        message: "Issuer name not available for enrichment."
+      });
+      return;
+    }
+
+    const requestId = issuerEnrichmentRequestId.current + 1;
+    issuerEnrichmentRequestId.current = requestId;
+    setIssuerEnrichment(null);
+    setIssuerEnrichmentStatus({ state: "loading", message: "Enriching issuer..." });
+
+    try {
+      const response = await enrichIssuer({
+        issuer_name: issuerName,
+        context: buildIssuerContext(detail, selected),
+        force_refresh: forceRefresh,
+        ratings_use_web: true,
+        ratings_web_max_results: 5,
+        ratings_web_search_options: { search_context_size: "high" }
+      });
+      if (response?.status === "cached" && response.enrichment) {
+        setIssuerEnrichment(response.enrichment);
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "ready", enrichment: response.enrichment }
+        }));
+        setIssuerEnrichmentStatus({ state: "done", message: "" });
+        return;
+      }
+      if (response?.status === "queued" && response.job_id) {
+        setIssuerEnrichmentStatus({
+          state: "queued",
+          message: "Queued for enrichment..."
+        });
+        pollIssuerEnrichment(response.job_id, issuerName, requestId);
+        return;
+      }
+      setIssuerEnrichmentStatus({
+        state: "failed",
+        message: "Unexpected enrichment response."
+      });
+    } catch (err) {
+      setIssuerEnrichmentStatus({
+        state: "failed",
+        message: err.message || "Issuer enrichment failed."
+      });
+    }
+  };
+
+  const handleEnrichIssuer = async () => {
+    await runIssuerEnrichment(false);
+  };
+
+  const handleForceRefresh = async () => {
+    await runIssuerEnrichment(true);
+  };
+
+  useEffect(() => {
+    if (!selected) return;
+    if (issuerEnrichment || issuerEnrichmentStatus.state === "loading" || issuerEnrichmentStatus.state === "queued") {
+      return;
+    }
+    const issuerName = detail?.overview?.issuerName || selected?.IssuerNameFull || "";
+    if (!issuerName) return;
+    let active = true;
+    fetchIssuerEnrichment(issuerName)
+      .then((data) => {
+        if (!active) return;
+        setIssuerEnrichment(data);
+        setIssuerTableEnrichment((prev) => ({
+          ...prev,
+          [issuerName]: { status: "ready", enrichment: data }
+        }));
+        setIssuerEnrichmentStatus({ state: "done", message: "" });
+      })
+      .catch((err) => {
+        if (!active) return;
+        if (String(err.message || "").includes("(404)")) return;
+        setIssuerEnrichmentStatus({
+          state: "failed",
+          message: err.message || "Issuer enrichment failed."
+        });
+      });
+    return () => {
+      active = false;
+    };
+  }, [selected, detail, issuerEnrichment, issuerEnrichmentStatus.state]);
+
+  useEffect(() => {
+    if (!ratingPopover) return;
+    const handleClick = (event) => {
+      if (!ratingContainerRef.current) return;
+      if (!ratingContainerRef.current.contains(event.target)) {
+        setRatingPopover(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+    };
+  }, [ratingPopover]);
 
   const addToPortfolio = (bond) => {
     setPortfolio((prev) => {
@@ -972,6 +1620,10 @@ export default function App() {
   }, [bonds]);
 
   const closeDetails = () => {
+    issuerEnrichmentRequestId.current += 1;
+    setIssuerEnrichment(null);
+    setIssuerEnrichmentStatus({ state: "idle", message: "" });
+    setRatingPopover(null);
     setSelected(null);
     setDetail(null);
     setDetailError("");
@@ -1011,6 +1663,37 @@ export default function App() {
     };
   }, [detail, selected]);
 
+  const liquidityEstimate = useMemo(() => {
+    const market = detail?.market || {};
+    const spreadInfo = computeLiquiditySpread(
+      detail?.liquidity,
+      market,
+      pricing.ask,
+      pricing.bid
+    );
+    if (!spreadInfo) return null;
+    let basePrice = null;
+    let baseLabel = null;
+    if (Number.isFinite(pricing.lastPrice) && pricing.lastPrice > 0) {
+      basePrice = pricing.lastPrice;
+      baseLabel = "last price";
+    } else if (Number.isFinite(pricing.mid) && pricing.mid > 0) {
+      basePrice = pricing.mid;
+      baseLabel = "mid price";
+    } else if (Number.isFinite(pricing.ask) && pricing.ask > 0) {
+      basePrice = pricing.ask;
+      baseLabel = "ask price";
+    }
+    const haircut = computeLiquidityHaircut(spreadInfo.spread, basePrice, notional);
+    if (!haircut) return null;
+    return {
+      ...spreadInfo,
+      ...haircut,
+      basePrice,
+      baseLabel
+    };
+  }, [detail, pricing, notional]);
+
   const feeInputs = useMemo(
     () => ({
       tierOneNotional: commissionTierOneNotional,
@@ -1037,6 +1720,41 @@ export default function App() {
   }, [detail, selected, bondInputs, notional]);
 
   const schedulePeriods = cashflowSchedule.length || null;
+
+  const cashflowScheduleDisplay = useMemo(() => {
+    if (cashflowSchedule.length === 0) return [];
+    let price = null;
+    let priceLabel = null;
+    if (Number.isFinite(pricing.lastPrice) && pricing.lastPrice > 0) {
+      price = pricing.lastPrice;
+      priceLabel = "last price";
+    } else if (Number.isFinite(pricing.mid) && pricing.mid > 0) {
+      price = pricing.mid;
+      priceLabel = "mid price";
+    } else if (Number.isFinite(pricing.ask) && pricing.ask > 0) {
+      price = pricing.ask;
+      priceLabel = "ask price";
+    }
+
+    const rows = cashflowSchedule.map((row) => ({
+      ...row,
+      type: row.isMaturity ? "Coupon + principal" : "Coupon"
+    }));
+    if (!Number.isFinite(price)) {
+      return rows;
+    }
+
+    const purchaseTotal = -((price / 100) * notional);
+    const purchaseRow = {
+      date: startOfDay(new Date()),
+      coupon: 0,
+      principal: 0,
+      total: purchaseTotal,
+      isMaturity: false,
+      type: `Purchase (${priceLabel})`
+    };
+    return [purchaseRow, ...rows];
+  }, [cashflowSchedule, pricing, notional]);
 
   const scenarioAsk = useMemo(() => {
     if (!selected) return null;
@@ -1088,6 +1806,8 @@ export default function App() {
     [portfolio]
   );
   const portfolioBasisLabel = portfolioPricingBasis === "last" ? "last" : "ask";
+  const portfolioCostTooltip = `Sum((${portfolioBasisLabel} price / 100) * notional).`;
+  const portfolioAvgYieldTooltip = `Sum(${portfolioBasisLabel} yield * notional) / Sum(notional).`;
 
   const resolveHoldingInputs = (holding, pricingBasis) => {
     const bond = holding.bond || {};
@@ -1148,6 +1868,12 @@ export default function App() {
       pricingBasis === "last" || fallbackUsed
         ? (Number.isFinite(computedYield) ? computedYield : askYield)
         : askYield;
+    const spreadInfo = computeLiquiditySpread(
+      detailData.liquidity,
+      detailData.market,
+      askPrice,
+      bidPrice
+    );
 
     return {
       bond,
@@ -1160,7 +1886,9 @@ export default function App() {
       lastPrice,
       askYield,
       computedYield,
-      yieldToWorst
+      yieldToWorst,
+      liquiditySpread: spreadInfo?.spread ?? null,
+      liquiditySource: spreadInfo?.source ?? null
     };
   };
 
@@ -1174,6 +1902,9 @@ export default function App() {
     let totalTax = 0;
     let totalBuyFees = 0;
     let totalRoundTripFees = 0;
+    let totalLiquidityHaircut = 0;
+    let liquidityNotional = 0;
+    let liquiditySamples = 0;
     let maturityWeighted = 0;
     let maturityWeight = 0;
     let yieldWeighted = 0;
@@ -1236,6 +1967,17 @@ export default function App() {
         totalRoundTripFees += scenario.buyFee + scenario.sellFee;
       }
 
+      const liquidityHaircut = computeLiquidityHaircut(
+        inputs.liquiditySpread,
+        price,
+        notionalValue
+      );
+      if (liquidityHaircut) {
+        totalLiquidityHaircut += liquidityHaircut.haircutValue;
+        liquidityNotional += notionalValue;
+        liquiditySamples += 1;
+      }
+
       const cashflows = buildCashflows({
         price,
         couponRate,
@@ -1259,6 +2001,14 @@ export default function App() {
       totalTax,
       totalBuyFees,
       totalRoundTripFees,
+      liquidityHaircutTotal: totalLiquidityHaircut,
+      liquidityHaircutPct: liquidityNotional
+        ? (totalLiquidityHaircut / liquidityNotional) * 100
+        : null,
+      liquidityCoverage: {
+        samples: liquiditySamples,
+        total: portfolio.length
+      },
       avgMaturity: maturityWeight ? maturityWeighted / maturityWeight : null,
       avgYield: yieldWeight ? yieldWeighted / yieldWeight : null,
       portfolioIrrGross: xirr(cashflowsGross),
@@ -1266,6 +2016,15 @@ export default function App() {
       portfolioIrrTax: xirr(cashflowsTax)
     };
   }, [portfolio, feeInputs, taxRate, notional, portfolioDetails, portfolioPricingBasis]);
+
+  const portfolioLiquidityTooltip = useMemo(() => {
+    if (!portfolioStats) return "";
+    return (
+      `Assumes immediate sale at estimated bid. Estimated bid = ${portfolioBasisLabel} price - ` +
+      `(avg spread / 2). Spread source uses avg of last ${LIQUIDITY_SPREAD_DAYS} days when available. ` +
+      `Coverage: ${portfolioStats.liquidityCoverage.samples}/${portfolioStats.liquidityCoverage.total} holdings.`
+    );
+  }, [portfolioStats, portfolioBasisLabel]);
 
   const portfolioSchedule = useMemo(() => {
     if (portfolio.length === 0) return [];
@@ -1298,6 +2057,8 @@ export default function App() {
     const map = new Map();
     portfolio.forEach((holding) => {
       const inputs = resolveHoldingInputs(holding, portfolioPricingBasis);
+      const bond = inputs.bond || {};
+      const label = bond.ShortName || bond.IssuerNameFull || holding.valorId;
       if (!inputs.maturityDate || !Number.isFinite(holding.notional)) return;
       const schedule = buildCashflowSchedule({
         maturityDate: inputs.maturityDate,
@@ -1311,15 +2072,24 @@ export default function App() {
           date: row.date,
           coupon: 0,
           principal: 0,
-          total: 0
+          total: 0,
+          sources: new Set()
         };
         existing.coupon += row.coupon;
         existing.principal += row.principal;
         existing.total += row.total;
+        if (row.total > 0) {
+          existing.sources.add(label);
+        }
         map.set(key, existing);
       });
     });
-    return Array.from(map.values()).sort((a, b) => a.date - b.date);
+    return Array.from(map.values())
+      .map((row) => ({
+        ...row,
+        sources: Array.from(row.sources || []).sort()
+      }))
+      .sort((a, b) => a.date - b.date);
   }, [portfolio, portfolioDetails, portfolioPricingBasis, portfolioScheduleView]);
 
   const portfolioDetailStatus = useMemo(() => {
@@ -1543,7 +2313,7 @@ export default function App() {
             )
           ) : null}
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap results-table">
           {volumeError ? <p className="error">{volumeError}</p> : null}
           <table>
             <thead>
@@ -1555,6 +2325,42 @@ export default function App() {
                     onClick={() => handleSort("IssuerNameFull")}
                   >
                     Issuer{sortIndicator("IssuerNameFull")}
+                  </button>
+                </th>
+                <th
+                  className="rating-col"
+                  aria-sort={sortState.key === "MoodysRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("MoodysRating")}
+                  >
+                    Moody&apos;s{sortIndicator("MoodysRating")}
+                  </button>
+                </th>
+                <th
+                  className="rating-col"
+                  aria-sort={sortState.key === "FitchRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("FitchRating")}
+                  >
+                    Fitch{sortIndicator("FitchRating")}
+                  </button>
+                </th>
+                <th
+                  className="rating-col"
+                  aria-sort={sortState.key === "SPRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("SPRating")}
+                  >
+                    S&amp;P{sortIndicator("SPRating")}
                   </button>
                 </th>
                 <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
@@ -1572,16 +2378,7 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("MaturityDate")}
                   >
-                    Maturity{sortIndicator("MaturityDate")}
-                  </button>
-                </th>
-                <th aria-sort={sortState.key === "Term" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("Term")}
-                  >
-                    Term{sortIndicator("Term")}
+                    Term / Maturity{sortIndicator("MaturityDate")}
                   </button>
                 </th>
                 <th aria-sort={sortState.key === "CouponRate" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
@@ -1611,24 +2408,6 @@ export default function App() {
                     After-tax yield{sortIndicator("AfterTaxYield")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "AskPrice" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("AskPrice")}
-                  >
-                    Ask{sortIndicator("AskPrice")}
-                  </button>
-                </th>
-                <th aria-sort={sortState.key === "BidPrice" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("BidPrice")}
-                  >
-                    Bid{sortIndicator("BidPrice")}
-                  </button>
-                </th>
                 <th aria-sort={sortState.key === "DayVolume" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
                   <button
                     type="button"
@@ -1655,9 +2434,89 @@ export default function App() {
               {sortedBonds.map((bond) => (
                 <tr key={bond.ValorId}>
                   <td>{bond.IssuerNameFull || "-"}</td>
+                  <td className="rating-col">
+                    {(() => {
+                      const issuerName = bond.IssuerNameFull || "";
+                      if (!issuerName) return "-";
+                      const entry = issuerTableEnrichment[issuerName];
+                      const status = entry?.status;
+                      if (!entry || status === "missing" || status === "idle") {
+                        return (
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => handleFetchIssuerRatings(issuerName)}
+                          >
+                            Fetch ratings
+                          </button>
+                        );
+                      }
+                      if (status === "loading" || status === "queued") {
+                        return "Fetching…";
+                      }
+                      if (status === "error") {
+                        return (
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => handleFetchIssuerRatings(issuerName)}
+                          >
+                            Retry
+                          </button>
+                        );
+                      }
+                      const moodysRaw = entry?.enrichment?.moodys;
+                      const moodysValue = normalizeMoodysRating(moodysRaw);
+                      return moodysValue ? moodysValue : "null";
+                    })()}
+                  </td>
+                  <td className="rating-col">
+                    {(() => {
+                      const issuerName = bond.IssuerNameFull || "";
+                      if (!issuerName) return "-";
+                      const entry = issuerTableEnrichment[issuerName];
+                      const status = entry?.status;
+                      if (!entry || status === "missing" || status === "idle") {
+                        return "-";
+                      }
+                      if (status === "loading" || status === "queued") {
+                        return "Fetching…";
+                      }
+                      if (status === "error") {
+                        return "Error";
+                      }
+                      const fitchRaw = entry?.enrichment?.fitch;
+                      const fitchValue = normalizeSpFitchRating(fitchRaw);
+                      return fitchValue ? fitchValue : "null";
+                    })()}
+                  </td>
+                  <td className="rating-col">
+                    {(() => {
+                      const issuerName = bond.IssuerNameFull || "";
+                      if (!issuerName) return "-";
+                      const entry = issuerTableEnrichment[issuerName];
+                      const status = entry?.status;
+                      if (!entry || status === "missing" || status === "idle") {
+                        return "-";
+                      }
+                      if (status === "loading" || status === "queued") {
+                        return "Fetching…";
+                      }
+                      if (status === "error") {
+                        return "Error";
+                      }
+                      const spRaw = entry?.enrichment?.sp;
+                      const spValue = normalizeSpFitchRating(spRaw);
+                      return spValue ? spValue : "null";
+                    })()}
+                  </td>
                   <td>{bond.ShortName || "-"}</td>
-                  <td>{formatDateYMD(bond.MaturityDate)}</td>
-                  <td>{formatDurationYears(maturityYearsFromValue(bond.MaturityDate))}</td>
+                  <td>
+                    <div className="term-stack">
+                      <span>{formatDurationYears(maturityYearsFromValue(bond.MaturityDate))}</span>
+                      <span className="term-stack-sub">{formatDateYMD(bond.MaturityDate)}</span>
+                    </div>
+                  </td>
                   <td>{formatPercent(parseNumber(bond.CouponRate), 2)}</td>
                   <td>{formatPercent(parseNumber(bond.YieldToWorst), 2)}</td>
                   <td>
@@ -1670,22 +2529,39 @@ export default function App() {
                       "-"
                     )}
                   </td>
-                  <td>{formatNumber(parseNumber(bond.AskPrice), 2)}</td>
-                  <td>{formatNumber(parseNumber(bond.BidPrice), 2)}</td>
                   <td>
                     {(() => {
+                      const totalVolume = parseNumber(bond.TotalVolume);
                       const entry = volumes[bond.ValorId];
-                      const volume = parseNumber(entry?.volume);
-                      if (Number.isFinite(volume)) {
-                        const label = formatNumber(volume, 0);
-                        return entry?.date ? (
+                      const fallback = parseNumber(entry?.volume);
+                      const useFallback =
+                        !(Number.isFinite(totalVolume) && totalVolume > 0) &&
+                        Number.isFinite(fallback);
+                      if (!useFallback && Number.isFinite(totalVolume)) {
+                        const label = formatNumber(totalVolume, 0);
+                        return bond.MarketDate ? (
                           <MetricInline
                             label={label}
-                            tooltip={`Last day volume (${formatDateYMD(entry.date)})`}
+                            tooltip={`Market volume (${formatDateYMD(bond.MarketDate)})`}
                           />
                         ) : (
                           label
                         );
+                      }
+                      if (useFallback) {
+                        const label = formatNumber(fallback, 0);
+                        if (entry?.date) {
+                          const sourceLabel = entry.source
+                            ? ` (${entry.source.replace(/_/g, " ")})`
+                            : "";
+                          return (
+                            <MetricInline
+                              label={label}
+                              tooltip={`Market volume${sourceLabel} (${formatDateYMD(entry.date)})`}
+                            />
+                          );
+                        }
+                        return label;
                       }
                       if (volumeLoading) return "…";
                       return "-";
@@ -1719,7 +2595,7 @@ export default function App() {
               ))}
               {!loading && bonds.length === 0 ? (
                 <tr>
-                  <td colSpan="13" className="empty">
+                  <td colSpan="14" className="empty">
                     No bonds found for the current filter.
                   </td>
                 </tr>
@@ -1777,86 +2653,116 @@ export default function App() {
             <p className="meta">No bonds in your portfolio yet.</p>
           ) : (
             <>
-              <div className="summary-grid">
-                <div>
-                  <MetricLabel label="Holdings" tooltip={METRIC_TOOLTIPS.holdings} />
-                  <strong>{portfolio.length}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Total notional"
-                    tooltip={METRIC_TOOLTIPS.totalNotional}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalNotional, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label={`Cost at ${portfolioBasisLabel}`}
-                    tooltip={METRIC_TOOLTIPS.costAtAsk}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalCost, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel label="Avg maturity" tooltip={METRIC_TOOLTIPS.avgMaturity} />
-                  <strong>{formatDurationYears(portfolioStats?.avgMaturity)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label={`Avg ${portfolioBasisLabel} yield`}
-                    tooltip={METRIC_TOOLTIPS.avgAskYield}
-                  />
-                  <strong>{formatPercent(portfolioStats?.avgYield, 2)}</strong>
-                </div>
-                <div>
-                  <MetricLabel label="Gross return" tooltip={METRIC_TOOLTIPS.grossReturn} />
-                  <strong>{formatCurrency(portfolioStats?.totalGross, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Return after fees"
-                    tooltip={METRIC_TOOLTIPS.returnAfterFees}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalFee, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Return after tax"
-                    tooltip={METRIC_TOOLTIPS.returnAfterTax}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalTax, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel label="Portfolio IRR" tooltip={METRIC_TOOLTIPS.portfolioIrr} />
-                  <strong>{formatPercent(portfolioStats?.portfolioIrrGross, 2)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Portfolio IRR (fees)"
-                    tooltip={METRIC_TOOLTIPS.portfolioIrrFees}
-                  />
-                  <strong>{formatPercent(portfolioStats?.portfolioIrrFee, 2)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Portfolio IRR (fees + tax)"
-                    tooltip={METRIC_TOOLTIPS.portfolioIrrFeesTax}
-                  />
-                  <strong>{formatPercent(portfolioStats?.portfolioIrrTax, 2)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Total buy fees"
-                    tooltip={METRIC_TOOLTIPS.totalBuyFees}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalBuyFees, 0)}</strong>
-                </div>
-                <div>
-                  <MetricLabel
-                    label="Round-trip fees"
-                    tooltip={METRIC_TOOLTIPS.roundTripFees}
-                  />
-                  <strong>{formatCurrency(portfolioStats?.totalRoundTripFees, 0)}</strong>
-                </div>
+              <div className="summary-groups">
+                <section className="summary-group">
+                  <h4>Exposure</h4>
+                  <div className="summary-grid">
+                    <div>
+                      <MetricLabel label="Holdings" tooltip={METRIC_TOOLTIPS.holdings} />
+                      <strong>{portfolio.length}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Total notional"
+                        tooltip={METRIC_TOOLTIPS.totalNotional}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalNotional, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label={`Cost at ${portfolioBasisLabel}`}
+                        tooltip={portfolioCostTooltip}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalCost, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel label="Avg maturity" tooltip={METRIC_TOOLTIPS.avgMaturity} />
+                      <strong>{formatDurationYears(portfolioStats?.avgMaturity)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label={`Avg ${portfolioBasisLabel} yield`}
+                        tooltip={portfolioAvgYieldTooltip}
+                      />
+                      <strong>{formatPercent(portfolioStats?.avgYield, 2)}</strong>
+                    </div>
+                  </div>
+                </section>
+                <section className="summary-group">
+                  <h4>Returns</h4>
+                  <div className="summary-grid">
+                    <div>
+                      <MetricLabel label="Gross return" tooltip={METRIC_TOOLTIPS.grossReturn} />
+                      <strong>{formatCurrency(portfolioStats?.totalGross, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Return after fees"
+                        tooltip={METRIC_TOOLTIPS.returnAfterFees}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalFee, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Return after tax"
+                        tooltip={METRIC_TOOLTIPS.returnAfterTax}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalTax, 0)}</strong>
+                    </div>
+                  </div>
+                </section>
+                <section className="summary-group">
+                  <h4>IRR &amp; fees</h4>
+                  <div className="summary-grid">
+                    <div>
+                      <MetricLabel label="Portfolio IRR" tooltip={METRIC_TOOLTIPS.portfolioIrr} />
+                      <strong>{formatPercent(portfolioStats?.portfolioIrrGross, 2)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Portfolio IRR (fees)"
+                        tooltip={METRIC_TOOLTIPS.portfolioIrrFees}
+                      />
+                      <strong>{formatPercent(portfolioStats?.portfolioIrrFee, 2)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Portfolio IRR (fees + tax)"
+                        tooltip={METRIC_TOOLTIPS.portfolioIrrFeesTax}
+                      />
+                      <strong>{formatPercent(portfolioStats?.portfolioIrrTax, 2)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Total buy fees"
+                        tooltip={METRIC_TOOLTIPS.totalBuyFees}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalBuyFees, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Round-trip fees"
+                        tooltip={METRIC_TOOLTIPS.roundTripFees}
+                      />
+                      <strong>{formatCurrency(portfolioStats?.totalRoundTripFees, 0)}</strong>
+                    </div>
+                    <div>
+                      <MetricLabel
+                        label="Est liquidation haircut"
+                        tooltip={portfolioLiquidityTooltip}
+                      />
+                      <strong>
+                        {formatCurrency(portfolioStats?.liquidityHaircutTotal, 0)}
+                      </strong>
+                    </div>
+                    <div>
+                      <MetricLabel label="Avg haircut (%)" tooltip={portfolioLiquidityTooltip} />
+                      <strong>
+                        {formatPercent(portfolioStats?.liquidityHaircutPct, 2)}
+                      </strong>
+                    </div>
+                  </div>
+                </section>
               </div>
 
               <div className="table-wrap">
@@ -1870,6 +2776,7 @@ export default function App() {
                       <th>Price ({portfolioBasisLabel})</th>
                       <th>Notional</th>
                       <th>Gross return</th>
+                      <th>Liquidity haircut</th>
                       <th>IRR</th>
                       <th></th>
                     </tr>
@@ -1897,6 +2804,20 @@ export default function App() {
                         taxRate: taxRate / 100,
                         periodsOverride
                       });
+                      const liquidityHaircut = computeLiquidityHaircut(
+                        inputs.liquiditySpread,
+                        inputs.price,
+                        holding.notional
+                      );
+                      const liquidityMeta = liquidityHaircut
+                        ? {
+                            ...liquidityHaircut,
+                            spread: inputs.liquiditySpread,
+                            source: inputs.liquiditySource,
+                            basePrice: inputs.price,
+                            baseLabel: portfolioBasisLabel
+                          }
+                        : null;
                       return (
                         <tr key={holding.valorId}>
                           <td>{bond.IssuerNameFull || "-"}</td>
@@ -1917,6 +2838,16 @@ export default function App() {
                             />
                           </td>
                           <td>{formatCurrency(scenario?.grossAbs, 0)}</td>
+                          <td>
+                            {liquidityHaircut ? (
+                              <MetricInline
+                                label={formatCurrency(liquidityHaircut.haircutValue, 0)}
+                                tooltip={formatLiquidityTooltip(liquidityMeta)}
+                              />
+                            ) : (
+                              "-"
+                            )}
+                          </td>
                           <td>{formatPercent(scenario?.grossIrr, 2)}</td>
                           <td>
                             <button type="button" className="ghost" onClick={() => openDetails(bond)}>
@@ -1965,6 +2896,7 @@ export default function App() {
                       <thead>
                         <tr>
                           <th>Date</th>
+                          <th>Bonds</th>
                           <th>Coupon</th>
                           <th>Principal</th>
                           <th>Total</th>
@@ -1979,6 +2911,13 @@ export default function App() {
                                   row.date.getMonth() + 1
                                 ).padStart(2, "0")}${String(row.date.getDate()).padStart(2, "0")}`
                               )}
+                            </td>
+                            <td>
+                              <span className="schedule-sources">
+                                {row.sources && row.sources.length
+                                  ? row.sources.join(", ")
+                                  : "-"}
+                              </span>
                             </td>
                             <td>{formatCurrency(row.coupon, 2)}</td>
                             <td>{formatCurrency(row.principal, 2)}</td>
@@ -2073,6 +3012,139 @@ export default function App() {
             <div className="detail-grid">
               <section>
                 <h4>Issuer & security</h4>
+                <div className="enrichment-card">
+                  <div className="enrichment-header">
+                    <div>
+                      <p className="eyebrow">Issuer enrichment</p>
+                      <p className="meta">On-demand summary, ratings, and vegan check.</p>
+                    </div>
+                    <div className="enrichment-actions">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={handleCopyPrompt}
+                        disabled={
+                          issuerEnrichmentStatus.state === "loading" ||
+                          issuerEnrichmentStatus.state === "queued"
+                        }
+                      >
+                        Copy LLM prompt
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={handleForceRefresh}
+                        disabled={
+                          issuerEnrichmentStatus.state === "loading" ||
+                          issuerEnrichmentStatus.state === "queued"
+                        }
+                      >
+                        Force refresh
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={handleEnrichIssuer}
+                        disabled={
+                          issuerEnrichmentStatus.state === "loading" ||
+                          issuerEnrichmentStatus.state === "queued"
+                        }
+                      >
+                        {issuerEnrichmentStatus.state === "loading"
+                          ? "Enriching..."
+                          : issuerEnrichmentStatus.state === "queued"
+                            ? "Queued..."
+                            : "Enrich issuer"}
+                      </button>
+                    </div>
+                  </div>
+                  {issuerEnrichmentStatus.state === "failed" ? (
+                    <p className="error">{issuerEnrichmentStatus.message}</p>
+                  ) : issuerEnrichmentStatus.state === "queued" ||
+                    issuerEnrichmentStatus.state === "loading" ? (
+                    <p className="meta">{issuerEnrichmentStatus.message}</p>
+                  ) : null}
+                  {issuerEnrichment ? (
+                    <div className="detail-list enrichment-list">
+                      <div>
+                        <span>Issuer summary</span>
+                        <strong>{issuerEnrichment.summary_md || "-"}</strong>
+                        <div className="detail-subtext enrichment-inline">
+                          <span>Vegan friendly: {formatVeganFriendly(issuerEnrichment.vegan_friendly)}</span>
+                          {issuerEnrichment.vegan_explanation ? (
+                            <InfoTooltip text={issuerEnrichment.vegan_explanation} />
+                          ) : null}
+                        </div>
+                      </div>
+                      <div>
+                        <span>Ratings</span>
+                        <div className="rating-stack" ref={ratingContainerRef}>
+                          <div className="rating-item">
+                            <strong>Moody&apos;s</strong>
+                            <button
+                              type="button"
+                              className="rating-button"
+                              onClick={() =>
+                                setRatingPopover((prev) =>
+                                  prev === "moodys" ? null : "moodys"
+                                )
+                              }
+                              aria-expanded={ratingPopover === "moodys"}
+                            >
+                              {issuerEnrichment.moodys || "-"}
+                            </button>
+                            {ratingPopover === "moodys" ? (
+                              <div className="rating-popover">
+                                <p>Sources</p>
+                                <SourcePopover sources={issuerEnrichment.sources} />
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="rating-item">
+                            <strong>Fitch</strong>
+                            <button
+                              type="button"
+                              className="rating-button"
+                              onClick={() =>
+                                setRatingPopover((prev) =>
+                                  prev === "fitch" ? null : "fitch"
+                                )
+                              }
+                              aria-expanded={ratingPopover === "fitch"}
+                            >
+                              {issuerEnrichment.fitch || "-"}
+                            </button>
+                            {ratingPopover === "fitch" ? (
+                              <div className="rating-popover">
+                                <p>Sources</p>
+                                <SourcePopover sources={issuerEnrichment.sources} />
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="rating-item">
+                            <strong>S&amp;P</strong>
+                            <button
+                              type="button"
+                              className="rating-button"
+                              onClick={() =>
+                                setRatingPopover((prev) => (prev === "sp" ? null : "sp"))
+                              }
+                              aria-expanded={ratingPopover === "sp"}
+                            >
+                              {issuerEnrichment.sp || "-"}
+                            </button>
+                            {ratingPopover === "sp" ? (
+                              <div className="rating-popover">
+                                <p>Sources</p>
+                                <SourcePopover sources={issuerEnrichment.sources} />
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
                 <div className="detail-list">
                   <div>
                     <span>Issuer</span>
@@ -2164,6 +3236,22 @@ export default function App() {
                     <strong>{formatPercent(parseNumber(detail.market?.MidSpread), 2)}</strong>
                   </div>
                   <div>
+                    <span className="metric-label-inline">
+                      Liquidity haircut (est.)
+                      {liquidityEstimate ? (
+                        <InfoTooltip text={formatLiquidityTooltip(liquidityEstimate)} />
+                      ) : null}
+                    </span>
+                    <strong>
+                      {liquidityEstimate
+                        ? `${formatCurrency(liquidityEstimate.haircutValue, 0)} (${formatPercent(
+                            liquidityEstimate.haircutPct,
+                            2
+                          )})`
+                        : "-"}
+                    </strong>
+                  </div>
+                  <div>
                     <span>Gov spread (bps)</span>
                     <strong>
                       {Number.isFinite(parseNumber(detail.gov_spread_bps)) ? (
@@ -2231,6 +3319,50 @@ export default function App() {
                 </div>
 
                 <div className="return-grid">
+                  <div className="return-card">
+                    <h5>Last price</h5>
+                    <p>
+                      <MetricInline
+                        label="Gross return"
+                        tooltip={RETURN_TOOLTIPS.grossReturn}
+                      />
+                      : {formatCurrency(scenarioLast?.grossAbs)}
+                    </p>
+                    <p>
+                      <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
+                      : {formatPercent(scenarioLast?.grossIrr, 2)}
+                    </p>
+                    <p>
+                      <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
+                      {formatCurrency(scenarioLast?.feeAbs)}
+                    </p>
+                    <p>
+                      <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
+                      {formatPercent(scenarioLast?.feeIrr, 2)}
+                    </p>
+                    <p>
+                      <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
+                      {formatCurrency(scenarioLast?.taxAbs)}
+                    </p>
+                    <p>
+                      <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
+                      {formatPercent(scenarioLast?.taxIrr, 2)}
+                    </p>
+                    <p>
+                      <MetricInline
+                        label="Break-even (fees)"
+                        tooltip={RETURN_TOOLTIPS.breakEvenFees}
+                      />
+                      : {formatDurationYears(scenarioLast?.breakEvenFees)}
+                    </p>
+                    <p>
+                      <MetricInline
+                        label="Break-even (fees + tax)"
+                        tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
+                      />
+                      : {formatDurationYears(scenarioLast?.breakEvenFeesTax)}
+                    </p>
+                  </div>
                   <div className="return-card">
                     <h5>Ask price</h5>
                     <p>
@@ -2319,69 +3451,26 @@ export default function App() {
                       : {formatDurationYears(scenarioMid?.breakEvenFeesTax)}
                     </p>
                   </div>
-                  <div className="return-card">
-                    <h5>Last price</h5>
-                    <p>
-                      <MetricInline
-                        label="Gross return"
-                        tooltip={RETURN_TOOLTIPS.grossReturn}
-                      />
-                      : {formatCurrency(scenarioLast?.grossAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
-                      : {formatPercent(scenarioLast?.grossIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
-                      {formatCurrency(scenarioLast?.feeAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
-                      {formatPercent(scenarioLast?.feeIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
-                      {formatCurrency(scenarioLast?.taxAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
-                      {formatPercent(scenarioLast?.taxIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFees}
-                      />
-                      : {formatDurationYears(scenarioLast?.breakEvenFees)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees + tax)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
-                      />
-                      : {formatDurationYears(scenarioLast?.breakEvenFeesTax)}
-                    </p>
-                  </div>
                 </div>
               </section>
 
               <section>
                 <h4>Cash flow schedule</h4>
-                {cashflowSchedule.length === 0 ? (
+                {cashflowScheduleDisplay.length === 0 ? (
                   <p className="meta">No upcoming cash flows found.</p>
                 ) : (
                   <table className="schedule-table">
                     <thead>
                       <tr>
                         <th>Date</th>
+                        <th>Type</th>
                         <th>Coupon</th>
                         <th>Principal</th>
                         <th>Total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {cashflowSchedule.map((row) => (
+                      {cashflowScheduleDisplay.map((row, index) => (
                         <tr key={`${row.date.getTime()}-${row.total}`}>
                           <td>
                             {formatDateYMD(
@@ -2390,6 +3479,7 @@ export default function App() {
                               ).padStart(2, "0")}${String(row.date.getDate()).padStart(2, "0")}`
                             )}
                           </td>
+                          <td>{row.type || (index === 0 ? "Purchase" : "Coupon")}</td>
                           <td>{formatCurrency(row.coupon, 2)}</td>
                           <td>{formatCurrency(row.principal, 2)}</td>
                           <td>{formatCurrency(row.total, 2)}</td>

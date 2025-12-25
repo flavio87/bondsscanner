@@ -20,6 +20,7 @@ LIST_FIELDS = [
     "AskPrice",
     "MarketDate",
     "MarketTime",
+    "TotalVolume",
     "IssuerNameFull",
     "ProductLine",
     "IndustrySectorCode",
@@ -50,6 +51,16 @@ DETAIL_MARKET_FIELDS = [
     "YearAgoPerformance",
     "YearToDatePerformance",
     "YieldToWorst",
+    "TotalVolume",
+    "LatestTradeVolume",
+    "MarketDate",
+    "MarketTime",
+    "OnMarketVolume",
+    "OffBookVolume",
+    "OnMarketTrades",
+    "OffBookTrades",
+    "OnMarketTurnover",
+    "OffBookTurnover",
 ]
 
 LIST_CACHE = TTLCache(ttl_seconds=300)
@@ -137,6 +148,36 @@ def _build_fqs_url(
     )
 
 
+def _build_fqs_command_url(
+    *,
+    command: str,
+    format_: str,
+    params: list[dict[str, Any]],
+    properties: Iterable[str],
+) -> str:
+    select_str = ",".join(properties).rstrip(",")
+    param_str = ""
+    for param in params:
+        key_values = param.get("keyValues") or []
+        key_parts: list[str] = []
+        for key_value in key_values:
+            key = key_value.get("key")
+            operator = key_value.get("operator")
+            value = key_value.get("value")
+            multi_operator = key_value.get("multiParamOperator")
+            if operator and value is not None:
+                if multi_operator:
+                    key_parts.append(
+                        f"{multi_operator}{key}{operator}{value}"
+                    )
+                else:
+                    key_parts.append(f"{key}{operator}{value}")
+            else:
+                key_parts.append(str(key))
+        param_str += f"&{param['name']}{param.get('operator', '')}{''.join(key_parts)}"
+    return f"{BASE_FQS}/{command}.{format_}?select={select_str}{param_str}"
+
+
 def _fetch_json(url: str, cache: Optional[TTLCache] = None) -> Any:
     if cache:
         cached = cache.get(url)
@@ -215,13 +256,24 @@ def fetch_government_bonds(currency: Optional[str]) -> list[dict[str, Any]]:
 
 
 def fetch_bond_market_data(valor_id: str) -> dict[str, Any]:
-    where = f"ValorId={valor_id}"
-    url = _build_fqs_url(
-        select=DETAIL_MARKET_FIELDS,
-        where=where,
-        order_by="ShortName",
-        page=1,
-        page_size=1,
+    params = [
+        {
+            "name": "where",
+            "operator": "=",
+            "keyValues": [
+                {
+                    "key": "ValorId",
+                    "operator": "=",
+                    "value": valor_id,
+                }
+            ],
+        }
+    ]
+    url = _build_fqs_command_url(
+        command="movie",
+        format_="json",
+        params=params,
+        properties=DETAIL_MARKET_FIELDS,
     )
     data = _fetch_json(url, cache=DETAIL_CACHE)
     items = _rows_to_dicts(data)

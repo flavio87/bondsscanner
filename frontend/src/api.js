@@ -42,3 +42,47 @@ export async function fetchBondVolumes(ids) {
   }
   return response.json();
 }
+
+export async function enrichIssuer(payload) {
+  const response = await fetch("/api/issuer/enrichment", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    throw new Error(`Enrichment failed (${response.status})`);
+  }
+  return response.json();
+}
+
+export async function fetchIssuerEnrichment(issuerName) {
+  const response = await fetch(
+    `/api/issuer/enrichment/${encodeURIComponent(issuerName)}`
+  );
+  if (!response.ok) {
+    throw new Error(`Enrichment fetch failed (${response.status})`);
+  }
+  return response.json();
+}
+
+export async function fetchIssuerEnrichmentBatch(issuers, includeExpired = false) {
+  const response = await fetch("/api/issuer/enrichment/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ issuers, include_expired: includeExpired })
+  });
+  if (!response.ok) {
+    throw new Error(`Batch enrichment fetch failed (${response.status})`);
+  }
+  return response.json();
+}
+
+export async function fetchIssuerEnrichmentJob(jobId) {
+  const response = await fetch(
+    `/api/issuer/enrichment/jobs/${encodeURIComponent(jobId)}`
+  );
+  if (!response.ok) {
+    throw new Error(`Job fetch failed (${response.status})`);
+  }
+  return response.json();
+}
