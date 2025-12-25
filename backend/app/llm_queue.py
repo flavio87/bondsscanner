@@ -11,7 +11,6 @@ from .cache_db import (
     get_issuer_enrichment,
     get_job,
     update_job_status,
-    update_job_status,
     upsert_issuer_enrichment,
 )
 from .llm_client import LlmClientError, call_llm, extract_json
@@ -24,7 +23,7 @@ LOG_PATH = Path(__file__).resolve().parent / "data" / "llm_fetch.log"
 
 def is_celery_enabled() -> bool:
     backend = (get_env("LLM_QUEUE_BACKEND", "") or "").strip().lower()
-    if backend and backend != "celery":
+    if backend != "celery":
         return False
     return celery_app is not None
 
@@ -227,6 +226,40 @@ def _process_issuer_job(job: dict) -> dict:
     }
 
 
+def _process_job_by_id(job_id: str) -> None:
+    job = get_job(job_id)
+    if not job:
+        return
+    status = job.get("status")
+    if status not in {"queued", "running"}:
+        return
+    update_job_status(job_id, status="running")
+    kind = job.get("kind")
+    try:
+        if kind == "issuer_enrichment":
+            result = _process_issuer_job(job)
+        else:
+            raise ValueError(f"Unknown job kind: {kind}")
+        update_job_status(job_id, status="done", result=result)
+    except (LlmClientError, ValueError, json.JSONDecodeError) as exc:
+        update_job_status(job_id, status="failed", error=str(exc))
+
+
+if celery_app:
+
+    @celery_app.task(name="bonds.issuer_enrichment")
+    def celery_process_issuer_job(job_id: str) -> None:
+        _process_job_by_id(job_id)
+
+
+def dispatch_job(job_id: str, kind: str) -> None:
+    if is_celery_enabled():
+        if kind == "issuer_enrichment":
+            queue_name = get_env("CELERY_QUEUE_NAME", "bonds")
+            celery_process_issuer_job.apply_async(args=[job_id], queue=queue_name)
+        return
+
+
 def _worker_loop() -> None:
     poll_seconds = max(1, int(get_env("LLM_QUEUE_POLL_SECONDS", "1") or "1"))
     stale_seconds = int(get_env("LLM_JOB_STALE_SECONDS", "900") or "900")
@@ -256,6 +289,8 @@ def _worker_loop() -> None:
 def start_worker() -> None:
     global _worker_started
     if _worker_started:
+        return
+    if is_celery_enabled():
         return
     _worker_started = True
     thread = threading.Thread(target=_worker_loop, daemon=True)

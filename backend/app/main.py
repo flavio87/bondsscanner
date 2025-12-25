@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,7 +13,7 @@ from .cache_db import (
     init_db,
     upsert_issuer_enrichment,
 )
-from .llm_queue import get_job_status, start_worker
+from .llm_queue import dispatch_job, get_job_status, start_worker
 from .llm_client import LlmClientError, call_llm, extract_json
 from .settings import load_env
 from .cache import TTLCache
@@ -33,7 +35,15 @@ from .spread import (
     build_spread_price_meta,
 )
 
-app = FastAPI(title="Versified Bonds API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_env()
+    init_db()
+    start_worker()
+    yield
+
+
+app = FastAPI(title="Versified Bonds API", lifespan=lifespan)
 
 VOLUME_CACHE = TTLCache(ttl_seconds=3600)
 
@@ -44,12 +54,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-def startup() -> None:
-    load_env()
-    init_db()
-    start_worker()
 
 ALLOWED_ORDER_FIELDS = {
     "MaturityDate",
@@ -179,6 +183,7 @@ def enqueue_issuer_enrichment(request: IssuerEnrichmentRequest) -> dict:
             "ratings_web_search_options": request.ratings_web_search_options,
         },
     )
+    dispatch_job(job_id, "issuer_enrichment")
     return {"status": "queued", "job_id": job_id}
 
 

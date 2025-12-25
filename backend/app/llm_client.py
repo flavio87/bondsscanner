@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any, Optional
 
 import httpx
@@ -39,6 +40,30 @@ def _get_gemini_base_url() -> str:
         get_env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
         or "https://generativelanguage.googleapis.com/v1beta"
     )
+
+
+def _get_timeout_seconds(key: str, default: float) -> float:
+    raw = get_env(key)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_retry_config() -> tuple[int, float]:
+    max_retries_raw = get_env("LLM_HTTP_MAX_RETRIES", "2")
+    backoff_raw = get_env("LLM_HTTP_RETRY_BASE_SECONDS", "1.0")
+    try:
+        max_retries = max(0, int(max_retries_raw))
+    except (TypeError, ValueError):
+        max_retries = 2
+    try:
+        backoff = max(0.0, float(backoff_raw))
+    except (TypeError, ValueError):
+        backoff = 1.0
+    return max_retries, backoff
 
 
 def _extract_openrouter_text(response: dict[str, Any]) -> str:
@@ -115,11 +140,18 @@ def call_openrouter(
         "X-Title": "Versified Bonds",
     }
     url = f"{_get_base_url().rstrip('/')}/chat/completions"
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(url, headers=headers, json=payload)
-    except httpx.RequestError as exc:
-        raise LlmClientError(f"OpenRouter request failed: {exc}") from exc
+    timeout_seconds = _get_timeout_seconds("OPENROUTER_TIMEOUT_SECONDS", 90.0)
+    max_retries, backoff = _get_retry_config()
+    response = None
+    for attempt in range(max_retries + 1):
+        try:
+            with httpx.Client(timeout=timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
+            break
+        except httpx.RequestError as exc:
+            if attempt >= max_retries:
+                raise LlmClientError(f"OpenRouter request failed: {exc}") from exc
+            time.sleep(backoff * (2 ** attempt))
     if response.status_code >= 400:
         raise LlmClientError(f"OpenRouter error {response.status_code}: {response.text}")
     return response.json()
@@ -148,11 +180,18 @@ def call_gemini(
         "x-goog-api-key": api_key,
         "Content-Type": "application/json",
     }
-    try:
-        with httpx.Client(timeout=120) as client:
-            response = client.post(url, headers=headers, json=payload)
-    except httpx.RequestError as exc:
-        raise LlmClientError(f"Gemini request failed: {exc}") from exc
+    timeout_seconds = _get_timeout_seconds("GEMINI_TIMEOUT_SECONDS", 180.0)
+    max_retries, backoff = _get_retry_config()
+    response = None
+    for attempt in range(max_retries + 1):
+        try:
+            with httpx.Client(timeout=timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
+            break
+        except httpx.RequestError as exc:
+            if attempt >= max_retries:
+                raise LlmClientError(f"Gemini request failed: {exc}") from exc
+            time.sleep(backoff * (2 ** attempt))
     if response.status_code >= 400:
         raise LlmClientError(f"Gemini error {response.status_code}: {response.text}")
     return response.json()
