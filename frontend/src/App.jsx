@@ -8,10 +8,12 @@ import {
   fetchIssuerEnrichment,
   fetchIssuerEnrichmentBatch,
   fetchIssuerEnrichmentJob,
+  fetchGovBondCurve,
   fetchSnbCurve
 } from "./api.js";
 import {
   buildCashflows,
+  computeTieredFee,
   computeScenario,
   parseNumber,
   xirr,
@@ -40,6 +42,7 @@ const SIX_DETAIL_BASE =
 const LIQUIDITY_SPREAD_DAYS = 5;
 const LLM_POLL_INTERVAL_MS = 1000;
 const LLM_MAX_ATTEMPTS = 120;
+const ZERO_FEES = { tierOneNotional: 0, tierOneRate: 0, tierTwoRate: 0 };
 
 function maturityYearsFromValue(value) {
   if (!value) return null;
@@ -63,6 +66,36 @@ function maturityYearsFromValue(value) {
   const diff = maturityDate - now;
   if (!Number.isFinite(diff) || diff <= 0) return null;
   return diff / (365.25 * 24 * 60 * 60 * 1000);
+}
+
+function interpolateCurveYield(points, targetYears) {
+  if (!Array.isArray(points) || !Number.isFinite(targetYears)) return null;
+  const sorted = [...points].sort((a, b) => a.years - b.years);
+  if (sorted.length < 2) return null;
+  if (targetYears <= sorted[0].years) {
+    const low = sorted[0];
+    const high = sorted[1];
+    if (high.years === low.years) return low.yield;
+    const weight = (targetYears - low.years) / (high.years - low.years);
+    return low.yield + weight * (high.yield - low.yield);
+  }
+  if (targetYears >= sorted[sorted.length - 1].years) {
+    const high = sorted[sorted.length - 1];
+    const low = sorted[sorted.length - 2];
+    if (high.years === low.years) return high.yield;
+    const weight = (targetYears - low.years) / (high.years - low.years);
+    return low.yield + weight * (high.yield - low.yield);
+  }
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i].years >= targetYears) {
+      const low = sorted[i - 1];
+      const high = sorted[i];
+      if (high.years === low.years) return low.yield;
+      const weight = (targetYears - low.years) / (high.years - low.years);
+      return low.yield + weight * (high.yield - low.yield);
+    }
+  }
+  return null;
 }
 
 function buildSixDetailUrl(valorId) {
@@ -246,6 +279,24 @@ function computeLiquiditySpread(liquidity, market, ask, bid) {
   return null;
 }
 
+function computeAverageLiquiditySpread(liquidity) {
+  const rows = Array.isArray(liquidity) ? liquidity : [];
+  const spreads = rows
+    .map((row) => {
+      const spread = parseNumber(row.avgSpread);
+      const date = parseDateValue(row.tradingDate);
+      return { spread, date };
+    })
+    .filter((row) => Number.isFinite(row.spread) && row.spread > 0)
+    .sort((a, b) => (b.date?.getTime() || 0) - (a.date?.getTime() || 0));
+
+  if (spreads.length === 0) return null;
+  const sample = spreads.slice(0, LIQUIDITY_SPREAD_DAYS);
+  const average =
+    sample.reduce((total, row) => total + row.spread, 0) / sample.length;
+  return { average, sampleSize: sample.length };
+}
+
 function computeLiquidityHaircut(spread, price, notional) {
   if (!Number.isFinite(spread) || spread <= 0) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
@@ -354,6 +405,30 @@ function formatGovSpreadTooltip(meta) {
       : "Interpolated SNB gov yield unavailable";
 
   return `${priceLine}\n${yieldLine}\nCurve date: ${curveDate}\nSpread solves PV(cashflows, curve + spread) = price.`;
+}
+
+function formatGovSpreadYtwTooltip({ yieldToWorst, govYield, curveDate }) {
+  if (!Number.isFinite(yieldToWorst) || !Number.isFinite(govYield)) {
+    return "No spread data available.";
+  }
+  return [
+    `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
+    `Gov curve yield: ${formatPercent(govYield, 2)}`,
+    `Curve date: ${curveDate || "-"}`,
+    "Spread = (YieldToWorst - gov curve)."
+  ].join("\n");
+}
+
+function formatImpliedGovSpreadTooltip({ yieldToWorst, govYield, source }) {
+  if (!Number.isFinite(yieldToWorst) || !Number.isFinite(govYield)) {
+    return "No spread data available.";
+  }
+  return [
+    `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
+    `Implied gov yield: ${formatPercent(govYield, 2)}`,
+    `Curve source: ${source || "implied gov curve"}`,
+    "Spread = (YieldToWorst - implied gov curve)."
+  ].join("\n");
 }
 
 function InfoTooltip({ text }) {
@@ -465,6 +540,472 @@ function startOfDay(date) {
   return result;
 }
 
+function yearFraction30E360(start, end) {
+  if (!start || !end) return null;
+  const y1 = start.getFullYear();
+  const y2 = end.getFullYear();
+  const m1 = start.getMonth() + 1;
+  const m2 = end.getMonth() + 1;
+  const d1 = Math.min(start.getDate(), 30);
+  const d2 = Math.min(end.getDate(), 30);
+  return (360 * (y2 - y1) + 30 * (m2 - m1) + (d2 - d1)) / 360;
+}
+
+function buildCashflowScheduleFromRedemption({
+  redemptionDate,
+  frequency,
+  notional,
+  couponRate,
+  settlementDate
+}) {
+  if (!redemptionDate) return [];
+  const freq = Number.isFinite(frequency) && frequency > 0 ? frequency : 1;
+  const monthsStep = Math.max(1, Math.round(12 / freq));
+  const cutoff = startOfDay(settlementDate || new Date());
+  const schedule = [];
+  const redemptionTime = redemptionDate.getTime();
+  let cursor = redemptionDate;
+
+  for (let i = 0; i < 200; i += 1) {
+    const cursorDay = startOfDay(cursor);
+    if (cursorDay >= cutoff) {
+      const isRedemption = cursor.getTime() === redemptionTime;
+      const coupon = (couponRate / 100) * notional / freq;
+      const principal = isRedemption ? notional : 0;
+      schedule.unshift({
+        date: cursorDay,
+        coupon,
+        principal,
+        total: coupon + principal,
+        isRedemption
+      });
+    } else {
+      break;
+    }
+    cursor = addMonths(cursor, -monthsStep);
+  }
+  return schedule;
+}
+
+function computeAccruedInterest({ couponRate, notional, accrualStart, settlementDate }) {
+  if (!accrualStart || !settlementDate) return null;
+  const frac = yearFraction30E360(accrualStart, settlementDate);
+  if (!Number.isFinite(frac) || frac < 0) return null;
+  return ((couponRate || 0) / 100) * notional * frac;
+}
+
+function alignAccrualStart({ accrualStart, settlementDate, frequency }) {
+  if (!accrualStart || !settlementDate) return accrualStart;
+  const freq = Number.isFinite(frequency) && frequency > 0 ? frequency : 1;
+  const monthsStep = Math.max(1, Math.round(12 / freq));
+  let anchor = startOfDay(accrualStart);
+  const settlement = startOfDay(settlementDate);
+
+  // If anchor is after settlement, walk backwards.
+  while (anchor > settlement) {
+    anchor = addMonths(anchor, -monthsStep);
+  }
+
+  // Walk forward to the latest coupon date before settlement.
+  for (let i = 0; i < 120; i += 1) {
+    const next = addMonths(anchor, monthsStep);
+    if (next > settlement) break;
+    anchor = next;
+  }
+
+  return anchor;
+}
+
+function computeYieldFromSchedule({ price, schedule, settlementDate }) {
+  const priceValue = parseNumber(price);
+  if (!Number.isFinite(priceValue) || priceValue <= 0) return null;
+  if (!schedule || schedule.length === 0) return null;
+  const cashflows = [{ t: 0, amount: -priceValue }];
+  schedule.forEach((row) => {
+    const t = yearFraction30E360(settlementDate, row.date);
+    if (!Number.isFinite(t) || t <= 0) return;
+    cashflows.push({ t, amount: row.coupon + row.principal });
+  });
+  return xirr(cashflows);
+}
+
+function computeDurationFromSchedule({ pricePer100, schedule, settlementDate, yieldRate }) {
+  const priceValue = parseNumber(pricePer100);
+  if (!Number.isFinite(priceValue) || priceValue <= 0) return null;
+  if (!schedule || schedule.length === 0) return null;
+  let y = parseNumber(yieldRate);
+  if (!Number.isFinite(y)) {
+    y = computeYieldFromSchedule({
+      price: priceValue,
+      schedule,
+      settlementDate
+    });
+  }
+  if (!Number.isFinite(y)) return null;
+  const rate = y / 100;
+  let pv = 0;
+  let weighted = 0;
+  schedule.forEach((row) => {
+    const t = yearFraction30E360(settlementDate, row.date);
+    if (!Number.isFinite(t) || t <= 0) return;
+    const cf = row.coupon + row.principal;
+    const df = 1 / Math.pow(1 + rate, t);
+    pv += cf * df;
+    weighted += t * cf * df;
+  });
+  if (!Number.isFinite(pv) || pv <= 0) return null;
+  const macaulay = weighted / pv;
+  const modified = macaulay / (1 + rate);
+  return { macaulay, modified };
+}
+
+function computeOneYearBreakEvenShift({
+  pricePer100,
+  schedule,
+  settlementDate,
+  yieldRate,
+  duration
+}) {
+  const priceValue = parseNumber(pricePer100);
+  if (!Number.isFinite(priceValue) || priceValue <= 0) return null;
+  if (!schedule || schedule.length === 0) return null;
+  const modDuration = Number.isFinite(duration) ? duration : null;
+  if (!modDuration || modDuration <= 0) return null;
+  const y = parseNumber(yieldRate);
+  if (!Number.isFinite(y)) return null;
+  const rate = y / 100;
+  const horizon = addMonths(settlementDate, 12);
+  let cashWithin = 0;
+  let priceAtHorizon = 0;
+  schedule.forEach((row) => {
+    if (row.date <= horizon) {
+      cashWithin += row.coupon + row.principal;
+      return;
+    }
+    const t = yearFraction30E360(horizon, row.date);
+    if (!Number.isFinite(t) || t <= 0) return;
+    const cf = row.coupon + row.principal;
+    priceAtHorizon += cf / Math.pow(1 + rate, t);
+  });
+  const totalReturn = cashWithin + (priceAtHorizon - priceValue);
+  if (!Number.isFinite(totalReturn)) return null;
+  return totalReturn / (modDuration * priceValue);
+}
+
+function buildActualScenarioForSchedule({
+  pricePer100,
+  schedule,
+  settlementDate,
+  notional,
+  couponRate,
+  taxRate,
+  fees
+}) {
+  const priceValue = parseNumber(pricePer100);
+  if (!Number.isFinite(priceValue) || priceValue <= 0) return null;
+  if (!schedule || schedule.length === 0) return null;
+  const tradeValue = (priceValue / 100) * notional;
+  const tax = Number.isFinite(taxRate) ? taxRate : 0;
+  const buyFee = computeTieredFee(
+    tradeValue,
+    fees.tierOneNotional,
+    fees.tierOneRate,
+    fees.tierTwoRate
+  );
+  const sellFee = computeTieredFee(
+    tradeValue,
+    fees.tierOneNotional,
+    fees.tierOneRate,
+    fees.tierTwoRate
+  );
+
+  const cashflowsGross = [{ t: 0, amount: -tradeValue }];
+  const cashflowsFee = [{ t: 0, amount: -(tradeValue + buyFee) }];
+  const cashflowsTax = [{ t: 0, amount: -(tradeValue + buyFee) }];
+
+  schedule.forEach((row) => {
+    const t = yearFraction30E360(settlementDate, row.date);
+    if (!Number.isFinite(t) || t <= 0) return;
+    const grossAmount = row.coupon + row.principal;
+    const taxAmount = row.coupon * (1 - tax) + row.principal;
+    cashflowsGross.push({ t, amount: grossAmount });
+    cashflowsFee.push({ t, amount: grossAmount });
+    cashflowsTax.push({ t, amount: taxAmount });
+  });
+
+  const grossIrr = xirr(cashflowsGross);
+  const feeIrr = xirr(cashflowsFee);
+  const taxIrr = xirr(cashflowsTax);
+  const grossAbs = cashflowsGross.reduce((sum, flow) => sum + flow.amount, 0);
+  const feeAbs = cashflowsFee.reduce((sum, flow) => sum + flow.amount, 0);
+  const taxAbs = cashflowsTax.reduce((sum, flow) => sum + flow.amount, 0);
+
+  const annualYieldValue =
+    tradeValue && Number.isFinite(grossIrr) ? tradeValue * (grossIrr / 100) : null;
+  const annualTax = ((couponRate || 0) / 100) * notional * tax;
+  const breakEvenFees =
+    annualYieldValue && annualYieldValue > 0
+      ? (buyFee + sellFee) / annualYieldValue
+      : null;
+  const netAnnual = annualYieldValue !== null ? annualYieldValue - annualTax : null;
+  const breakEvenFeesTax =
+    netAnnual && netAnnual > 0 ? (buyFee + sellFee) / netAnnual : null;
+
+  return {
+    tradeValue,
+    buyFee,
+    sellFee,
+    grossAbs,
+    feeAbs,
+    taxAbs,
+    grossIrr,
+    feeIrr,
+    taxIrr,
+    breakEvenFees,
+    breakEvenFeesTax
+  };
+}
+
+function minIgnoreNull(a, b) {
+  if (a === null || a === undefined) return b ?? null;
+  if (b === null || b === undefined) return a ?? null;
+  if (!Number.isFinite(a)) return Number.isFinite(b) ? b : null;
+  if (!Number.isFinite(b)) return a;
+  return Math.min(a, b);
+}
+
+function computeActualGrossIrrForBond({ bond, detail }) {
+  if (!bond || !detail) return null;
+  const market = detail?.market || {};
+  const askYield = parseNumber(bond.YieldToWorst);
+  if (!Number.isFinite(askYield)) return null;
+
+  const lastPrice = parseNumber(
+    market.PreviousClosingPrice ?? market.ClosingPrice ?? bond.ClosingPrice
+  );
+  const ask = parseNumber(market.AskPrice ?? bond.AskPrice);
+  const bid = parseNumber(market.BidPrice ?? bond.BidPrice);
+  const mid =
+    Number.isFinite(ask) && Number.isFinite(bid) && ask > 0 && bid > 0
+      ? (ask + bid) / 2
+      : null;
+  const cleanPrice = Number.isFinite(lastPrice)
+    ? lastPrice
+    : Number.isFinite(mid)
+      ? mid
+      : Number.isFinite(ask)
+        ? ask
+        : null;
+  if (!Number.isFinite(cleanPrice)) return null;
+
+  const couponRate = parseNumber(detail?.details?.couponInfo?.couponRate ?? bond.CouponRate) || 0;
+  const frequency = parseNumber(detail?.details?.couponInfo?.interestFrequency) || 1;
+  const settlementRaw = market.MarketDate ?? market.LatestTradeDate ?? bond.MarketDate;
+  const settlementDate = startOfDay(parseDateValue(settlementRaw) || new Date());
+  const maturityDate = parseDateValue(
+    detail?.details?.maturity ?? detail?.overview?.maturityDate ?? bond.MaturityDate
+  );
+  if (!maturityDate) return null;
+
+  let accrualStart = parseDateValue(detail?.details?.couponInfo?.accruedInterestFromDate);
+  if (!accrualStart) {
+    const nextCouponSchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: maturityDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    if (nextCouponSchedule.length > 0) {
+      const nextCouponDate = nextCouponSchedule[0].date;
+      const monthsStep = Math.max(1, Math.round(12 / frequency));
+      accrualStart = addMonths(nextCouponDate, -monthsStep);
+    }
+  }
+  accrualStart = alignAccrualStart({
+    accrualStart,
+    settlementDate,
+    frequency
+  });
+
+  const accrued = computeAccruedInterest({
+    couponRate,
+    notional: 100,
+    accrualStart,
+    settlementDate
+  });
+  const dirtyPrice = Number.isFinite(accrued) ? cleanPrice + accrued : cleanPrice;
+
+  const maturitySchedule = buildCashflowScheduleFromRedemption({
+    redemptionDate: maturityDate,
+    frequency,
+    notional: 100,
+    couponRate,
+    settlementDate
+  });
+  const maturityScenario = buildActualScenarioForSchedule({
+    pricePer100: dirtyPrice,
+    schedule: maturitySchedule,
+    settlementDate,
+    notional: 100,
+    couponRate,
+    taxRate: 0,
+    fees: ZERO_FEES
+  });
+  let chosenScenario = maturityScenario;
+
+  const callDate = parseDateValue(detail?.details?.earliestRedemptionDate);
+  if (callDate && callDate > settlementDate) {
+    const callSchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: callDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    const callScenario = buildActualScenarioForSchedule({
+      pricePer100: dirtyPrice,
+      schedule: callSchedule,
+      settlementDate,
+      notional: 100,
+      couponRate,
+      taxRate: 0,
+      fees: ZERO_FEES
+    });
+    if (callScenario && Number.isFinite(callScenario.grossIrr)) {
+      if (!chosenScenario || !Number.isFinite(chosenScenario.grossIrr)) {
+        chosenScenario = callScenario;
+      } else if (callScenario.grossIrr < chosenScenario.grossIrr) {
+        chosenScenario = callScenario;
+      }
+    }
+  }
+
+  if (!chosenScenario || !Number.isFinite(chosenScenario.grossIrr)) return null;
+  return { grossIrr: chosenScenario.grossIrr, askYield };
+}
+
+function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
+  if (!bond || !detail) return null;
+  const market = detail?.market || {};
+  const askYield = parseNumber(bond.YieldToWorst);
+  if (!Number.isFinite(askYield)) return null;
+
+  const lastPrice = parseNumber(
+    market.PreviousClosingPrice ?? market.ClosingPrice ?? bond.ClosingPrice
+  );
+  const ask = parseNumber(market.AskPrice ?? bond.AskPrice);
+  const bid = parseNumber(market.BidPrice ?? bond.BidPrice);
+  const mid =
+    Number.isFinite(ask) && Number.isFinite(bid) && ask > 0 && bid > 0
+      ? (ask + bid) / 2
+      : null;
+  const cleanPrice = Number.isFinite(lastPrice)
+    ? lastPrice
+    : Number.isFinite(mid)
+      ? mid
+      : Number.isFinite(ask)
+        ? ask
+        : null;
+  if (!Number.isFinite(cleanPrice)) return null;
+
+  const couponRate = parseNumber(detail?.details?.couponInfo?.couponRate ?? bond.CouponRate) || 0;
+  const frequency = parseNumber(detail?.details?.couponInfo?.interestFrequency) || 1;
+  const settlementRaw = market.MarketDate ?? market.LatestTradeDate ?? bond.MarketDate;
+  const settlementDate = startOfDay(parseDateValue(settlementRaw) || new Date());
+  const maturityDate = parseDateValue(
+    detail?.details?.maturity ?? detail?.overview?.maturityDate ?? bond.MaturityDate
+  );
+  if (!maturityDate) return null;
+
+  let accrualStart = parseDateValue(detail?.details?.couponInfo?.accruedInterestFromDate);
+  if (!accrualStart) {
+    const nextCouponSchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: maturityDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    if (nextCouponSchedule.length > 0) {
+      const nextCouponDate = nextCouponSchedule[0].date;
+      const monthsStep = Math.max(1, Math.round(12 / frequency));
+      accrualStart = addMonths(nextCouponDate, -monthsStep);
+    }
+  }
+  accrualStart = alignAccrualStart({
+    accrualStart,
+    settlementDate,
+    frequency
+  });
+
+  const accrued = computeAccruedInterest({
+    couponRate,
+    notional: 100,
+    accrualStart,
+    settlementDate
+  });
+  const dirtyPrice = Number.isFinite(accrued) ? cleanPrice + accrued : cleanPrice;
+
+  const maturitySchedule = buildCashflowScheduleFromRedemption({
+    redemptionDate: maturityDate,
+    frequency,
+    notional: 100,
+    couponRate,
+    settlementDate
+  });
+  const maturityScenario = buildActualScenarioForSchedule({
+    pricePer100: dirtyPrice,
+    schedule: maturitySchedule,
+    settlementDate,
+    notional: 100,
+    couponRate,
+    taxRate: taxRate || 0,
+    fees: fees || ZERO_FEES
+  });
+  let chosenScenario = maturityScenario;
+
+  const callDate = parseDateValue(detail?.details?.earliestRedemptionDate);
+  if (callDate && callDate > settlementDate) {
+    const callSchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: callDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    const callScenario = buildActualScenarioForSchedule({
+      pricePer100: dirtyPrice,
+      schedule: callSchedule,
+      settlementDate,
+      notional: 100,
+      couponRate,
+      taxRate: taxRate || 0,
+      fees: fees || ZERO_FEES
+    });
+    if (callScenario && Number.isFinite(callScenario.grossIrr)) {
+      if (!chosenScenario || !Number.isFinite(chosenScenario.grossIrr)) {
+        chosenScenario = callScenario;
+      } else if (callScenario.grossIrr < chosenScenario.grossIrr) {
+        chosenScenario = callScenario;
+      }
+    }
+  }
+
+  if (!chosenScenario || !Number.isFinite(chosenScenario.grossIrr)) return null;
+
+  return {
+    scenario: chosenScenario,
+    askYield,
+    cleanPrice,
+    dirtyPrice,
+    accrued,
+    settlementDate,
+    callDate,
+    maturityDate
+  };
+}
+
 function buildCashflowSchedule({ maturityDate, frequency, notional, couponRate }) {
   if (!maturityDate) return [];
   const freq = Number.isFinite(frequency) && frequency > 0 ? frequency : 1;
@@ -516,7 +1057,7 @@ function countCashflowPeriods({ maturityDate, frequency }) {
   return count > 0 ? count : null;
 }
 
-function ScatterPlot({ data, onPointClick }) {
+function ScatterPlot({ data, onPointClick, yLabel = "Ask yield (%)" }) {
   const [hovered, setHovered] = useState(null);
   const [mouse, setMouse] = useState(null);
   const width = 800;
@@ -640,7 +1181,7 @@ function ScatterPlot({ data, onPointClick }) {
         transform={`rotate(-90 18 ${(height + padding.top - padding.bottom) / 2})`}
         className="axis-label"
       >
-        Ask yield (%)
+        {yLabel}
       </text>
       {points.map((point) => (
         <circle
@@ -686,7 +1227,7 @@ function ScatterPlot({ data, onPointClick }) {
               {`Maturity: ${hovered.years.toFixed(2)}y`}
             </tspan>
             <tspan x={tooltip.x + 12} dy={18}>
-              {`Ask yield: ${hovered.askYield.toFixed(2)}%`}
+              {`${yLabel.replace(" (%)", "")}: ${hovered.askYield.toFixed(2)}%`}
             </tspan>
           </text>
         </g>
@@ -695,17 +1236,580 @@ function ScatterPlot({ data, onPointClick }) {
   );
 }
 
-function CurveChart({ points }) {
+function RatingScatterPlot({ data, onPointClick, xLabel, yLabel }) {
+  const [hovered, setHovered] = useState(null);
+  const [mouse, setMouse] = useState(null);
+  const width = 800;
+  const height = 320;
+  const padding = { left: 60, right: 20, top: 20, bottom: 50 };
+  const { points, xMin, xMax, yMin, yMax, ticks } = data;
+
+  const xScale = (value) =>
+    padding.left +
+    ((value - xMin) / (xMax - xMin)) * (width - padding.left - padding.right);
+  const yScale = (value) =>
+    height -
+    padding.bottom -
+    ((value - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom);
+
+  const yTicks = Array.from({ length: 5 }, (_, i) => {
+    const value = yMin + ((yMax - yMin) / 4) * i;
+    return { value, y: yScale(value) };
+  });
+  const xTicks = ticks.map((tick) => ({
+    ...tick,
+    x: xScale(tick.rank)
+  }));
+
+  const handleMouseMove = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const scaleX = width / rect.width;
+    const scaleY = height / rect.height;
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    const inside =
+      x >= padding.left &&
+      x <= width - padding.right &&
+      y >= padding.top &&
+      y <= height - padding.bottom;
+    setMouse({ x, y, inside });
+  };
+
+  const handleMouseLeave = () => {
+    setMouse(null);
+    setHovered(null);
+  };
+
+  const tooltip = hovered
+    ? {
+        width: 220,
+        height: 64,
+        x: Math.min(
+          width - padding.right - 220,
+          Math.max(padding.left, hovered.x + 12)
+        ),
+        y: Math.min(
+          height - padding.bottom - 64,
+          Math.max(padding.top, hovered.y - 12 - 64)
+        )
+      }
+    : null;
+
+  return (
+    <svg
+      className="scatter"
+      viewBox={`0 0 ${width} ${height}`}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+    >
+      <line
+        x1={padding.left}
+        y1={padding.top}
+        x2={padding.left}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      <line
+        x1={padding.left}
+        y1={height - padding.bottom}
+        x2={width - padding.right}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      {xTicks.map((tick) => (
+        <g key={`x-${tick.rank}`}>
+          <line
+            x1={tick.x}
+            y1={height - padding.bottom}
+            x2={tick.x}
+            y2={height - padding.bottom + 6}
+            className="tick"
+          />
+          <text x={tick.x} y={height - padding.bottom + 22} textAnchor="middle">
+            {tick.label}
+          </text>
+        </g>
+      ))}
+      {yTicks.map((tick) => (
+        <g key={`y-${tick.value}`}>
+          <line
+            x1={padding.left - 6}
+            y1={tick.y}
+            x2={padding.left}
+            y2={tick.y}
+            className="tick"
+          />
+          <text x={padding.left - 10} y={tick.y + 4} textAnchor="end">
+            {tick.value.toFixed(2)}
+          </text>
+        </g>
+      ))}
+      <text
+        x={(width + padding.left - padding.right) / 2}
+        y={height - 10}
+        textAnchor="middle"
+        className="axis-label"
+      >
+        {xLabel}
+      </text>
+      <text
+        x={18}
+        y={(height + padding.top - padding.bottom) / 2}
+        textAnchor="middle"
+        transform={`rotate(-90 18 ${(height + padding.top - padding.bottom) / 2})`}
+        className="axis-label"
+      >
+        {yLabel}
+      </text>
+      {points.map((point) => (
+        <circle
+          key={`${point.bond.ValorId}-${point.rating}`}
+          cx={xScale(point.ratingRank)}
+          cy={yScale(point.afterTax)}
+          r={hovered?.bond?.ValorId === point.bond.ValorId ? 6 : 4.5}
+          className={`chart-point${
+            hovered?.bond?.ValorId === point.bond.ValorId ? " is-hovered" : ""
+          }`}
+          onClick={() => onPointClick(point.bond)}
+          onMouseEnter={() =>
+            setHovered({
+              ...point,
+              x: xScale(point.ratingRank),
+              y: yScale(point.afterTax)
+            })
+          }
+          onMouseLeave={() => setHovered(null)}
+        >
+          <title>
+            {`${point.bond.ShortName || "Bond"} • ${point.rating} • ${point.afterTax.toFixed(2)}%`}
+          </title>
+        </circle>
+      ))}
+      {hovered && tooltip ? (
+        <g className="tooltip">
+          <rect
+            x={tooltip.x}
+            y={tooltip.y}
+            width={tooltip.width}
+            height={tooltip.height}
+            rx={10}
+            ry={10}
+          />
+          <text x={tooltip.x + 12} y={tooltip.y + 22}>
+            <tspan className="tooltip-title">
+              {hovered.bond.ShortName || "Bond"}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`S&P: ${hovered.rating}`}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`${yLabel.replace(" (%)", "")}: ${hovered.afterTax.toFixed(2)}%`}
+            </tspan>
+          </text>
+        </g>
+      ) : null}
+    </svg>
+  );
+}
+
+function XYScatterPlot({ data, onPointClick, xLabel, yLabel }) {
+  const [hovered, setHovered] = useState(null);
+  const width = 800;
+  const height = 320;
+  const padding = { left: 60, right: 20, top: 20, bottom: 50 };
+  const { points, xMin, xMax, yMin, yMax } = data;
+
+  const xScale = (value) =>
+    padding.left +
+    ((value - xMin) / (xMax - xMin)) * (width - padding.left - padding.right);
+  const yScale = (value) =>
+    height -
+    padding.bottom -
+    ((value - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom);
+
+  const ticks = 5;
+  const xTicks = Array.from({ length: ticks }, (_, i) => {
+    const value = xMin + ((xMax - xMin) / (ticks - 1)) * i;
+    return { value, x: xScale(value) };
+  });
+  const yTicks = Array.from({ length: ticks }, (_, i) => {
+    const value = yMin + ((yMax - yMin) / (ticks - 1)) * i;
+    return { value, y: yScale(value) };
+  });
+
+  const tooltip = hovered
+    ? {
+        width: 220,
+        height: 64,
+        x: Math.min(
+          width - padding.right - 220,
+          Math.max(padding.left, hovered.screenX + 12)
+        ),
+        y: Math.min(
+          height - padding.bottom - 64,
+          Math.max(padding.top, hovered.screenY - 12 - 64)
+        )
+      }
+    : null;
+
+  return (
+    <svg
+      className="scatter"
+      viewBox={`0 0 ${width} ${height}`}
+      onMouseLeave={() => setHovered(null)}
+    >
+      <line
+        x1={padding.left}
+        y1={padding.top}
+        x2={padding.left}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      <line
+        x1={padding.left}
+        y1={height - padding.bottom}
+        x2={width - padding.right}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      {xTicks.map((tick) => (
+        <g key={`x-${tick.value}`}>
+          <line
+            x1={tick.x}
+            y1={height - padding.bottom}
+            x2={tick.x}
+            y2={height - padding.bottom + 6}
+            className="tick"
+          />
+          <text x={tick.x} y={height - padding.bottom + 22} textAnchor="middle">
+            {tick.value.toFixed(2)}
+          </text>
+        </g>
+      ))}
+      {yTicks.map((tick) => (
+        <g key={`y-${tick.value}`}>
+          <line
+            x1={padding.left - 6}
+            y1={tick.y}
+            x2={padding.left}
+            y2={tick.y}
+            className="tick"
+          />
+          <text x={padding.left - 10} y={tick.y + 4} textAnchor="end">
+            {tick.value.toFixed(2)}
+          </text>
+        </g>
+      ))}
+      <text
+        x={(width + padding.left - padding.right) / 2}
+        y={height - 10}
+        textAnchor="middle"
+        className="axis-label"
+      >
+        {xLabel}
+      </text>
+      <text
+        x={18}
+        y={(height + padding.top - padding.bottom) / 2}
+        textAnchor="middle"
+        transform={`rotate(-90 18 ${(height + padding.top - padding.bottom) / 2})`}
+        className="axis-label"
+      >
+        {yLabel}
+      </text>
+      {points.map((point) => (
+        <circle
+          key={point.bond.ValorId}
+          cx={xScale(point.x)}
+          cy={yScale(point.y)}
+          r={hovered?.bond?.ValorId === point.bond.ValorId ? 6 : 4.5}
+          className={`chart-point${
+            hovered?.bond?.ValorId === point.bond.ValorId ? " is-hovered" : ""
+          }`}
+          onClick={() => onPointClick(point.bond)}
+          onMouseEnter={() =>
+            setHovered({
+              ...point,
+              screenX: xScale(point.x),
+              screenY: yScale(point.y)
+            })
+          }
+        >
+          <title>
+            {`${point.bond.ShortName || "Bond"} • ${point.x.toFixed(
+              2
+            )}% • ${point.y.toFixed(2)}%`}
+          </title>
+        </circle>
+      ))}
+      {hovered && tooltip ? (
+        <g className="tooltip" pointerEvents="none">
+          <rect
+            x={tooltip.x}
+            y={tooltip.y}
+            width={tooltip.width}
+            height={tooltip.height}
+            rx={10}
+            ry={10}
+          />
+          <text x={tooltip.x + 12} y={tooltip.y + 22}>
+            <tspan className="tooltip-title">
+              {hovered.bond.ShortName || "Bond"}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`${xLabel.replace(" (%)", "")}: ${hovered.x.toFixed(2)}%`}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`${yLabel.replace(" (%)", "")}: ${hovered.y.toFixed(2)}%`}
+            </tspan>
+          </text>
+        </g>
+      ) : null}
+    </svg>
+  );
+}
+
+function ViolinPlot({ data, onPointClick, yLabel }) {
+  const [hovered, setHovered] = useState(null);
+  const width = 800;
+  const height = 320;
+  const padding = { left: 60, right: 40, top: 20, bottom: 50 };
+  const { points, yMin, yMax } = data;
+  const plotWidth = width - padding.left - padding.right;
+  const centerX = padding.left + plotWidth / 2;
+
+  const values = points.map((point) => point.spread);
+  const n = values.length;
+  const mean =
+    n > 0 ? values.reduce((total, value) => total + value, 0) / n : 0;
+  const variance =
+    n > 1
+      ? values.reduce((total, value) => total + (value - mean) ** 2, 0) / (n - 1)
+      : 0;
+  const stdDev = Math.sqrt(variance);
+  const range = yMax - yMin || 1;
+  const bandwidth =
+    stdDev > 0
+      ? 1.06 * stdDev * Math.pow(n, -0.2)
+      : range / 6 || 1;
+
+  const densityAt = (value) => {
+    if (n === 0) return 0;
+    const denom = bandwidth * Math.sqrt(2 * Math.PI);
+    const total = values.reduce((sum, sample) => {
+      const u = (value - sample) / bandwidth;
+      return sum + Math.exp(-0.5 * u * u);
+    }, 0);
+    return total / (n * denom);
+  };
+
+  const sampleCount = 60;
+  const densitySamples = Array.from({ length: sampleCount }, (_, i) => {
+    const value = yMin + (range / (sampleCount - 1)) * i;
+    return { value, density: densityAt(value) };
+  });
+  const maxDensity = Math.max(0.0001, ...densitySamples.map((d) => d.density));
+  const maxWidth = plotWidth / 2 - 24;
+
+  const yScale = (value) =>
+    height -
+    padding.bottom -
+    ((value - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom);
+
+  const leftPath = densitySamples
+    .map((sample, index) => {
+      const widthOffset = (sample.density / maxDensity) * maxWidth;
+      const x = centerX - widthOffset;
+      const y = yScale(sample.value);
+      return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+    })
+    .join(" ");
+
+  const rightPath = densitySamples
+    .slice()
+    .reverse()
+    .map((sample) => {
+      const widthOffset = (sample.density / maxDensity) * maxWidth;
+      const x = centerX + widthOffset;
+      const y = yScale(sample.value);
+      return `L ${x} ${y}`;
+    })
+    .join(" ");
+
+  const violinPath = points.length > 0 ? `${leftPath} ${rightPath} Z` : "";
+
+  const yTicks = Array.from({ length: 5 }, (_, i) => {
+    const value = yMin + ((yMax - yMin) / 4) * i;
+    return { value, y: yScale(value) };
+  });
+
+  const jitterFromSeed = (seed) => {
+    let hash = 0;
+    const str = String(seed);
+    for (let i = 0; i < str.length; i += 1) {
+      hash = (hash * 31 + str.charCodeAt(i)) | 0;
+    }
+    const normalized = ((hash >>> 0) % 1000) / 1000 - 0.5;
+    return normalized;
+  };
+
+  const tooltip = hovered
+    ? {
+        width: 240,
+        height: 72,
+        x: Math.min(
+          width - padding.right - 240,
+          Math.max(padding.left, hovered.screenX + 12)
+        ),
+        y: Math.min(
+          height - padding.bottom - 72,
+          Math.max(padding.top, hovered.screenY - 12 - 72)
+        )
+      }
+    : null;
+
+  return (
+    <svg
+      className="scatter"
+      viewBox={`0 0 ${width} ${height}`}
+      onMouseLeave={() => setHovered(null)}
+    >
+      <line
+        x1={padding.left}
+        y1={padding.top}
+        x2={padding.left}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      <line
+        x1={padding.left}
+        y1={height - padding.bottom}
+        x2={width - padding.right}
+        y2={height - padding.bottom}
+        className="axis"
+      />
+      {yTicks.map((tick) => (
+        <g key={`y-${tick.value}`}>
+          <line
+            x1={padding.left - 6}
+            y1={tick.y}
+            x2={padding.left}
+            y2={tick.y}
+            className="tick"
+          />
+          <text x={padding.left - 10} y={tick.y + 4} textAnchor="end">
+            {tick.value.toFixed(3)}
+          </text>
+        </g>
+      ))}
+      <text
+        x={(width + padding.left - padding.right) / 2}
+        y={height - 10}
+        textAnchor="middle"
+        className="axis-label"
+      >
+        Density
+      </text>
+      <text
+        x={18}
+        y={(height + padding.top - padding.bottom) / 2}
+        textAnchor="middle"
+        transform={`rotate(-90 18 ${(height + padding.top - padding.bottom) / 2})`}
+        className="axis-label"
+      >
+        {yLabel}
+      </text>
+      {violinPath ? <path d={violinPath} className="violin-shape" /> : null}
+      {points.map((point) => {
+        const density = densityAt(point.spread);
+        const widthOffset = (density / maxDensity) * maxWidth;
+        const jitter = jitterFromSeed(point.bond.ValorId || point.spread) * widthOffset;
+        const x = centerX + jitter;
+        const y = yScale(point.spread);
+        return (
+          <circle
+            key={point.bond.ValorId}
+            cx={x}
+            cy={y}
+            r={hovered?.bond?.ValorId === point.bond.ValorId ? 6 : 4.5}
+            className={`chart-point${
+              hovered?.bond?.ValorId === point.bond.ValorId ? " is-hovered" : ""
+            }`}
+            onClick={() => onPointClick(point.bond)}
+            onMouseEnter={() =>
+              setHovered({
+                ...point,
+                screenX: x,
+                screenY: y
+              })
+            }
+          >
+            <title>
+              {`${point.bond.ShortName || "Bond"} • ${formatNumber(point.spread, 4)}`}
+            </title>
+          </circle>
+        );
+      })}
+      {hovered && tooltip ? (
+        <g className="tooltip" pointerEvents="none">
+          <rect
+            x={tooltip.x}
+            y={tooltip.y}
+            width={tooltip.width}
+            height={tooltip.height}
+            rx={10}
+            ry={10}
+          />
+          <text x={tooltip.x + 12} y={tooltip.y + 22}>
+            <tspan className="tooltip-title">
+              {hovered.bond.ShortName || "Bond"}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`Avg spread (last ${hovered.sampleSize} days): ${formatNumber(
+                hovered.spread,
+                4
+              )}`}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {hovered.bond.IssuerNameFull || ""}
+            </tspan>
+          </text>
+        </g>
+      ) : null}
+    </svg>
+  );
+}
+
+function CurveChart({ points, govPoints, govFits, onPointClick }) {
+  const [hovered, setHovered] = useState(null);
   const width = 800;
   const height = 240;
   const padding = { left: 60, right: 20, top: 20, bottom: 50 };
   const sorted = [...points].sort((a, b) => a.years - b.years);
-  const xValues = sorted.map((point) => point.years);
-  const yValues = sorted.map((point) => point.yield);
-  let xMin = Math.min(...xValues);
-  let xMax = Math.max(...xValues);
-  let yMin = Math.min(...yValues);
-  let yMax = Math.max(...yValues);
+  const govSorted = Array.isArray(govPoints)
+    ? [...govPoints].sort((a, b) => a.years - b.years)
+    : [];
+
+  const fitSpline = govFits?.spline || [];
+  const fitNelson = govFits?.nelson_siegel || [];
+  const xValues = [
+    ...sorted.map((point) => point.years),
+    ...govSorted.map((point) => point.years),
+    ...fitSpline.map((point) => point.years),
+    ...fitNelson.map((point) => point.years)
+  ];
+  const yValues = [
+    ...sorted.map((point) => point.yield),
+    ...govSorted.map((point) => point.yield),
+    ...fitSpline.map((point) => point.yield),
+    ...fitNelson.map((point) => point.yield)
+  ];
+  let xMin = xValues.length ? Math.min(...xValues) : 0;
+  let xMax = xValues.length ? Math.max(...xValues) : 1;
+  let yMin = yValues.length ? Math.min(...yValues) : 0;
+  let yMax = yValues.length ? Math.max(...yValues) : 1;
+  xMin = Math.min(0, xMin);
+  yMax = Math.max(yMax, 0.8);
   if (xMin === xMax) {
     xMin = Math.max(0, xMin - 1);
     xMax = xMax + 1;
@@ -740,6 +1844,52 @@ function CurveChart({ points }) {
       return `${index === 0 ? "M" : "L"} ${x} ${y}`;
     })
     .join(" ");
+
+  const govPath =
+    govSorted.length > 1
+      ? govSorted
+          .map((point, index) => {
+            const x = xScale(point.years);
+            const y = yScale(point.yield);
+            return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+          })
+          .join(" ")
+      : "";
+  const splinePath =
+    fitSpline.length > 1
+      ? fitSpline
+          .map((point, index) => {
+            const x = xScale(point.years);
+            const y = yScale(point.yield);
+            return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+          })
+          .join(" ")
+      : "";
+  const nelsonPath =
+    fitNelson.length > 1
+      ? fitNelson
+          .map((point, index) => {
+            const x = xScale(point.years);
+            const y = yScale(point.yield);
+            return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+          })
+          .join(" ")
+      : "";
+
+  const tooltip = hovered
+    ? {
+        width: 240,
+        height: 72,
+        x: Math.min(
+          width - padding.right - 240,
+          Math.max(padding.left, hovered.x + 12)
+        ),
+        y: Math.min(
+          height - padding.bottom - 72,
+          Math.max(padding.top, hovered.y - 12 - 72)
+        )
+      }
+    : null;
 
   return (
     <svg className="curve" viewBox={`0 0 ${width} ${height}`}>
@@ -802,7 +1952,10 @@ function CurveChart({ points }) {
       >
         Yield (%)
       </text>
-      <path d={path} className="curve-line" />
+      <path d={path} className="curve-line snb" />
+      {govPath ? <path d={govPath} className="curve-line gov" /> : null}
+      {splinePath ? <path d={splinePath} className="curve-line spline" /> : null}
+      {nelsonPath ? <path d={nelsonPath} className="curve-line nelson" /> : null}
       {sorted.map((point) => (
         <circle
           key={point.years}
@@ -814,6 +1967,64 @@ function CurveChart({ points }) {
           <title>{`${point.years.toFixed(1)}y • ${point.yield.toFixed(2)}%`}</title>
         </circle>
       ))}
+      {govSorted.map((point, index) => {
+        const bondPayload = point.valor_id
+          ? {
+              ValorId: point.valor_id,
+              ShortName: point.short_name,
+              MaturityDate: point.maturity,
+              IssuerNameFull: point.issuer,
+              YieldToWorst: point.yield
+            }
+          : null;
+        const x = xScale(point.years);
+        const y = yScale(point.yield);
+        return (
+          <circle
+            key={`${point.years}-${index}`}
+            cx={x}
+            cy={y}
+            r={hovered?.valor_id === point.valor_id ? 5.5 : 3.6}
+            className={`curve-point gov${hovered?.valor_id === point.valor_id ? " is-hovered" : ""}`}
+            onClick={() => {
+              if (bondPayload && onPointClick) onPointClick(bondPayload);
+            }}
+            onMouseEnter={() => {
+              setHovered({
+                ...point,
+                x,
+                y
+              });
+            }}
+            onMouseLeave={() => setHovered(null)}
+          >
+            <title>{`${point.short_name || "Gov bond"} • ${point.yield.toFixed(2)}%`}</title>
+          </circle>
+        );
+      })}
+      {hovered && tooltip ? (
+        <g className="tooltip" pointerEvents="none">
+          <rect
+            x={tooltip.x}
+            y={tooltip.y}
+            width={tooltip.width}
+            height={tooltip.height}
+            rx={10}
+            ry={10}
+          />
+          <text x={tooltip.x + 12} y={tooltip.y + 22}>
+            <tspan className="tooltip-title">
+              {hovered.short_name || hovered.isin || "Government bond"}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {`${hovered.yield.toFixed(2)}% • ${hovered.years.toFixed(1)}y`}
+            </tspan>
+            <tspan x={tooltip.x + 12} dy={18}>
+              {hovered.source ? `Source: ${hovered.source}` : ""}
+            </tspan>
+          </text>
+        </g>
+      ) : null}
     </svg>
   );
 }
@@ -823,7 +2034,8 @@ export default function App() {
   const [filters, setFilters] = useState({
     maturityBucket: "2-3",
     currency: "CHF",
-    country: "CH"
+    country: "CH",
+    industrySector: ""
   });
   const [sortState, setSortState] = useState({ key: "MaturityDate", dir: "asc" });
   const [pageSize, setPageSize] = useState(50);
@@ -831,10 +2043,13 @@ export default function App() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [showChart, setShowChart] = useState(true);
+  const [showChart, setShowChart] = useState(false);
   const [curve, setCurve] = useState(null);
   const [curveLoading, setCurveLoading] = useState(false);
   const [curveError, setCurveError] = useState("");
+  const [govCurve, setGovCurve] = useState(null);
+  const [govCurveLoading, setGovCurveLoading] = useState(false);
+  const [govCurveError, setGovCurveError] = useState("");
   const [volumes, setVolumes] = useState({});
   const [volumeLoading, setVolumeLoading] = useState(false);
   const [volumeError, setVolumeError] = useState("");
@@ -852,6 +2067,21 @@ export default function App() {
   }, [bonds]);
   const issuerNamesKey = issuerNames.join("|");
 
+  const sectorOptions = useMemo(() => {
+    const values = new Set();
+    bonds.forEach((bond) => {
+      if (bond?.IndustrySectorCode || bond?.IndustrySectorDesc) {
+        const code = bond.IndustrySectorCode ? String(bond.IndustrySectorCode) : "";
+        const desc = bond.IndustrySectorDesc ? String(bond.IndustrySectorDesc) : "";
+        values.add(code && desc ? `${code} - ${desc}` : desc || code);
+      }
+    });
+    if (filters.industrySector) {
+      values.add(String(filters.industrySector));
+    }
+    return Array.from(values).sort((a, b) => a.localeCompare(b, "en"));
+  }, [bonds, filters.industrySector]);
+
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -865,6 +2095,9 @@ export default function App() {
   const issuerEnrichmentRequestId = useRef(0);
   const [ratingPopover, setRatingPopover] = useState(null);
   const ratingContainerRef = useRef(null);
+  const [grossIrrChartDetails, setGrossIrrChartDetails] = useState({});
+  const [grossIrrChartLoading, setGrossIrrChartLoading] = useState(false);
+  const [grossIrrChartError, setGrossIrrChartError] = useState("");
 
   const [notional, setNotional] = useState(100000);
   const [notionalInput, setNotionalInput] = useState("100000");
@@ -961,59 +2194,92 @@ export default function App() {
     loadCurve();
   }, []);
 
+  useEffect(() => {
+    const loadGovCurve = async () => {
+      setGovCurveLoading(true);
+      setGovCurveError("");
+      try {
+        const data = await fetchGovBondCurve();
+        setGovCurve(data);
+      } catch (err) {
+        setGovCurveError(err.message || "Failed to load government bond curve.");
+      } finally {
+        setGovCurveLoading(false);
+      }
+    };
+    loadGovCurve();
+  }, []);
+
   const afterTaxYieldMap = useMemo(() => {
     const map = {};
     const tax = Number.isFinite(taxRate) ? taxRate : 0;
     bonds.forEach((bond) => {
-      const years = maturityYearsFromValue(bond.MaturityDate);
-      if (!Number.isFinite(years)) return;
-      const ask = parseNumber(bond.AskPrice);
-      const bid = parseNumber(bond.BidPrice);
-      const mid =
-        Number.isFinite(ask) &&
-        Number.isFinite(bid) &&
-        ask > 0 &&
-        bid > 0
-          ? (ask + bid) / 2
-          : null;
-      const close = parseNumber(bond.ClosingPrice);
-      let price = null;
-      let source = null;
-      if (Number.isFinite(mid)) {
-        price = mid;
-        source = "mid";
-      } else if (Number.isFinite(close) && close > 0) {
-        price = close;
-        source = "close";
-      } else {
-        return;
-      }
-      const couponRate = parseNumber(bond.CouponRate) || 0;
-      const taxedCouponRate = couponRate * (1 - tax / 100);
-      const ytm = yieldToMaturity({
-        price,
-        couponRate: taxedCouponRate,
-        years,
-        frequency: 1,
-        notional: 100
+      const detailEntry = grossIrrChartDetails[bond.ValorId];
+      if (!detailEntry || detailEntry.error) return;
+      const result = computeDirtyYtwScenarioForBond({
+        bond,
+        detail: detailEntry,
+        taxRate: tax / 100,
+        fees: ZERO_FEES
       });
+      if (!result || !Number.isFinite(result.scenario?.taxIrr)) return;
 
-      let priceLine = "Price basis: ";
-      if (source === "mid") {
-        priceLine += `mid = (${formatNumber(ask, 2)} + ${formatNumber(bid, 2)}) / 2 = ${formatNumber(price, 2)}`;
-      } else {
-        priceLine += `close = ${formatNumber(price, 2)}`;
-      }
-      const couponLine =
-        `Taxed coupon rate = ${formatPercent(couponRate, 2)} × (1 - ${formatNumber(tax, 1)}%) = ${formatPercent(taxedCouponRate, 2)}`;
-      const maturityLine = `Maturity term = ${formatDurationYears(years)}`;
-      const ytmLine = `YTM solves PV(cashflows) = ${formatNumber(price, 2)} (per 100)`;
-      const tooltip = `${priceLine}\n${couponLine}\n${maturityLine}\n${ytmLine}`;
+      const tooltip = [
+        `Price basis: dirty (${formatNumber(result.dirtyPrice, 4)}), clean ${formatNumber(
+          result.cleanPrice,
+          4
+        )}`,
+        `Accrued interest (30E/360): ${formatNumber(result.accrued, 4)}`,
+        `Settlement: ${formatDateYMD(result.settlementDate)}`,
+        `Call date: ${formatDateYMD(result.callDate) || "-"}`,
+        `Tax rate: ${formatNumber(tax, 1)}%`,
+        "After-tax IRR uses actual cashflow timing + YTW (call vs maturity)."
+      ].join("\n");
 
-      map[bond.ValorId] = { yield: ytm, tooltip };
+      map[bond.ValorId] = { yield: result.scenario.taxIrr, tooltip };
     });
     return map;
-  }, [bonds, taxRate]);
+  }, [bonds, taxRate, grossIrrChartDetails]);
+
+  const govSpreadYtwMap = useMemo(() => {
+    const map = {};
+    if (!curve?.points || curve.points.length === 0) return map;
+    bonds.forEach((bond) => {
+      const years = maturityYearsFromValue(bond.MaturityDate);
+      const yieldToWorst = parseNumber(bond.YieldToWorst);
+      if (!Number.isFinite(years) || !Number.isFinite(yieldToWorst)) return;
+      const govYield = interpolateCurveYield(curve.points, years);
+      if (!Number.isFinite(govYield)) return;
+      map[bond.ValorId] = {
+        spread: (yieldToWorst - govYield) * 100,
+        govYield,
+        yieldToWorst
+      };
+    });
+    return map;
+  }, [bonds, curve]);
+
+  const impliedGovSpreadMap = useMemo(() => {
+    const map = {};
+    const fitPoints = govCurve?.fits?.spline?.length
+      ? govCurve.fits.spline
+      : govCurve?.points || [];
+    if (!fitPoints || fitPoints.length === 0) return map;
+    bonds.forEach((bond) => {
+      const years = maturityYearsFromValue(bond.MaturityDate);
+      const yieldToWorst = parseNumber(bond.YieldToWorst);
+      if (!Number.isFinite(years) || !Number.isFinite(yieldToWorst)) return;
+      const govYield = interpolateCurveYield(fitPoints, years);
+      if (!Number.isFinite(govYield)) return;
+      map[bond.ValorId] = {
+        spread: (yieldToWorst - govYield) * 100,
+        govYield,
+        yieldToWorst,
+        source: govCurve?.fits?.spline?.length ? "PCHIP fit" : "implied points"
+      };
+    });
+    return map;
+  }, [bonds, govCurve]);
 
   useEffect(() => {
     if (bonds.length === 0) return;
@@ -1111,10 +2377,14 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
+      const sectorCode = filters.industrySector
+        ? String(filters.industrySector).split("-")[0].trim()
+        : "";
       const response = await fetchBonds({
         maturityBucket: filters.maturityBucket,
         currency: filters.currency,
         country: filters.country,
+        industrySector: sectorCode,
         page: 1,
         pageSize
       });
@@ -1139,7 +2409,7 @@ export default function App() {
   const sortedBonds = useMemo(() => {
     if (!sortState.key) return bonds;
     const direction = sortState.dir === "asc" ? 1 : -1;
-    const stringKeys = new Set(["IssuerNameFull", "ShortName"]);
+    const stringKeys = new Set(["IssuerNameFull", "ShortName", "IndustrySectorDesc"]);
 
     const getValue = (bond) => {
       switch (sortState.key) {
@@ -1153,6 +2423,8 @@ export default function App() {
           return maturityYearsFromValue(bond.MaturityDate);
         case "CouponRate":
           return parseNumber(bond.CouponRate);
+        case "IndustrySectorDesc":
+          return bond.IndustrySectorDesc || bond.IndustrySectorCode || "";
         case "YieldToWorst":
           return parseNumber(bond.YieldToWorst);
         case "AskPrice":
@@ -1160,7 +2432,9 @@ export default function App() {
         case "BidPrice":
           return parseNumber(bond.BidPrice);
         case "GovSpreadBps":
-          return parseNumber(bond.GovSpreadBps);
+          return parseNumber(govSpreadYtwMap[bond.ValorId]?.spread);
+        case "ImpliedGovSpreadBps":
+          return parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread);
         case "DayVolume":
           {
             const totalVolume = parseNumber(bond.TotalVolume);
@@ -1210,7 +2484,15 @@ export default function App() {
 
       return (Number(valueA) - Number(valueB)) * direction;
     });
-  }, [bonds, sortState, volumes, afterTaxYieldMap, issuerTableEnrichment]);
+  }, [
+    bonds,
+    sortState,
+    volumes,
+    afterTaxYieldMap,
+    issuerTableEnrichment,
+    govSpreadYtwMap,
+    impliedGovSpreadMap
+  ]);
 
   const sortIndicator = (key) => {
     if (sortState.key !== key) return "";
@@ -1619,6 +2901,255 @@ export default function App() {
     return { points, xMin, xMax, yMin, yMax };
   }, [bonds]);
 
+  const afterTaxChartData = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const years = maturityYearsFromValue(bond.MaturityDate);
+        if (!Number.isFinite(years)) return null;
+        const afterTax = parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+        if (!Number.isFinite(afterTax)) return null;
+        return { years, askYield: afterTax, bond };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) return { points: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+
+    const xValues = points.map((p) => p.years);
+    const yValues = points.map((p) => p.askYield);
+    let xMin = Math.min(...xValues);
+    let xMax = Math.max(...xValues);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (xMin === xMax) {
+      xMin = Math.max(0, xMin - 1);
+      xMax = xMax + 1;
+    }
+    if (yMin === yMax) {
+      yMin = yMin - 1;
+      yMax = yMax + 1;
+    }
+
+    return { points, xMin, xMax, yMin, yMax };
+  }, [bonds, afterTaxYieldMap]);
+
+  const ratingChartData = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const issuerName = bond.IssuerNameFull || "";
+        if (!issuerName) return null;
+        const entry = issuerTableEnrichment[issuerName];
+        if (!entry || entry.status !== "ready") return null;
+        const spRaw = entry?.enrichment?.sp;
+        const rating = normalizeSpFitchRating(spRaw);
+        if (!rating) return null;
+        const ratingRank = spFitchRatingRank(rating);
+        if (!Number.isFinite(ratingRank)) return null;
+        const afterTax = parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+        if (!Number.isFinite(afterTax)) return null;
+        return { rating, ratingRank, afterTax, bond };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) {
+      return { points: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1, ticks: [] };
+    }
+
+    const xValues = points.map((p) => p.ratingRank);
+    const yValues = points.map((p) => p.afterTax);
+    let xMin = Math.min(...xValues);
+    let xMax = Math.max(...xValues);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (xMin === xMax) {
+      xMin = Math.max(1, xMin - 1);
+      xMax = xMax + 1;
+    }
+    if (yMin === yMax) {
+      yMin = yMin - 1;
+      yMax = yMax + 1;
+    }
+
+    const ticks = Array.from(
+      new Map(
+        points
+          .map((point) => [point.ratingRank, point.rating])
+          .sort((a, b) => a[0] - b[0])
+      )
+    ).map(([rank, label]) => ({ rank, label }));
+
+    return { points, xMin, xMax, yMin, yMax, ticks };
+  }, [bonds, issuerTableEnrichment, afterTaxYieldMap]);
+
+  useEffect(() => {
+    if (bonds.length === 0) return;
+    const missing = bonds
+      .filter((bond) => bond?.ValorId)
+      .filter((bond) => !grossIrrChartDetails[bond.ValorId])
+      .map((bond) => bond.ValorId);
+    if (missing.length === 0) return;
+
+    let active = true;
+    setGrossIrrChartLoading(true);
+    setGrossIrrChartError("");
+
+    Promise.all(
+      missing.map(async (valorId) => {
+        try {
+          const data = await fetchBondDetails(valorId);
+          return { valorId, data };
+        } catch (err) {
+          return { valorId, error: err };
+        }
+      })
+    )
+      .then((results) => {
+        if (!active) return;
+        setGrossIrrChartDetails((prev) => {
+          const next = { ...prev };
+          results.forEach((result) => {
+            if (result.data) {
+              next[result.valorId] = result.data;
+              return;
+            }
+            if (result.error) {
+              next[result.valorId] = { error: true };
+            }
+          });
+          return next;
+        });
+        if (results.some((result) => result.error)) {
+          setGrossIrrChartError(
+            "Some bonds could not be enriched for gross IRR. Plot uses available data."
+          );
+        }
+      })
+      .finally(() => {
+        if (active) setGrossIrrChartLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [showChart, view, bonds, grossIrrChartDetails]);
+
+  const ratingAskChartData = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const issuerName = bond.IssuerNameFull || "";
+        if (!issuerName) return null;
+        const entry = issuerTableEnrichment[issuerName];
+        if (!entry || entry.status !== "ready") return null;
+        const spRaw = entry?.enrichment?.sp;
+        const rating = normalizeSpFitchRating(spRaw);
+        if (!rating) return null;
+        const ratingRank = spFitchRatingRank(rating);
+        if (!Number.isFinite(ratingRank)) return null;
+        const askYield = parseNumber(bond.YieldToWorst);
+        if (!Number.isFinite(askYield)) return null;
+        return { rating, ratingRank, afterTax: askYield, bond };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) {
+      return { points: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1, ticks: [] };
+    }
+
+    const xValues = points.map((p) => p.ratingRank);
+    const yValues = points.map((p) => p.afterTax);
+    let xMin = Math.min(...xValues);
+    let xMax = Math.max(...xValues);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (xMin === xMax) {
+      xMin = Math.max(1, xMin - 1);
+      xMax = xMax + 1;
+    }
+    if (yMin === yMax) {
+      yMin = yMin - 1;
+      yMax = yMax + 1;
+    }
+
+    const ticks = Array.from(
+      new Map(
+        points
+          .map((point) => [point.ratingRank, point.rating])
+          .sort((a, b) => a[0] - b[0])
+      )
+    ).map(([rank, label]) => ({ rank, label }));
+
+    return { points, xMin, xMax, yMin, yMax, ticks };
+  }, [bonds, issuerTableEnrichment]);
+
+  const grossIrrAskYieldChart = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const detailEntry = grossIrrChartDetails[bond.ValorId];
+        if (!detailEntry || detailEntry.error) return null;
+        const metrics = computeActualGrossIrrForBond({
+          bond,
+          detail: detailEntry
+        });
+        if (!metrics || !Number.isFinite(metrics.grossIrr)) return null;
+        if (!Number.isFinite(metrics.askYield)) return null;
+        return {
+          x: metrics.grossIrr,
+          y: metrics.askYield,
+          bond
+        };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) {
+      return { points: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+    }
+
+    const xValues = points.map((p) => p.x);
+    const yValues = points.map((p) => p.y);
+    let xMin = Math.min(...xValues);
+    let xMax = Math.max(...xValues);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (xMin === xMax) {
+      xMin = xMin - 1;
+      xMax = xMax + 1;
+    }
+    if (yMin === yMax) {
+      yMin = yMin - 1;
+      yMax = yMax + 1;
+    }
+
+    return { points, xMin, xMax, yMin, yMax };
+  }, [bonds, grossIrrChartDetails]);
+
+  const liquidityViolinData = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const detailEntry = grossIrrChartDetails[bond.ValorId];
+        if (!detailEntry || detailEntry.error) return null;
+        const average = computeAverageLiquiditySpread(detailEntry.liquidity);
+        if (!average || !Number.isFinite(average.average)) return null;
+        return {
+          spread: average.average,
+          sampleSize: average.sampleSize,
+          bond
+        };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) {
+      return { points: [], yMin: 0, yMax: 1 };
+    }
+
+    const yValues = points.map((point) => point.spread);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (yMin === yMax) {
+      yMin = Math.max(0, yMin - 0.5);
+      yMax = yMax + 0.5;
+    }
+    return { points, yMin, yMax };
+  }, [bonds, grossIrrChartDetails]);
+
   const closeDetails = () => {
     issuerEnrichmentRequestId.current += 1;
     setIssuerEnrichment(null);
@@ -1703,6 +3234,317 @@ export default function App() {
     [commissionTierOneNotional, commissionTierOneRate, commissionTierTwoRate]
   );
 
+  const actualYieldMetrics = useMemo(() => {
+    if (!selected) return null;
+    const priceCandidates = [
+      { label: "last price", value: pricing.lastPrice },
+      { label: "mid price", value: pricing.mid },
+      { label: "ask price", value: pricing.ask }
+    ];
+    const chosen = priceCandidates.find((item) => Number.isFinite(item.value));
+    if (!chosen) return null;
+
+    const cleanPrice = chosen.value;
+    const priceLabel = chosen.label;
+    const couponRate = bondInputs.couponRate || 0;
+    const frequency = bondInputs.frequency || 1;
+    const settlementRaw =
+      detail?.market?.MarketDate ?? detail?.market?.LatestTradeDate ?? null;
+    const settlementDate = startOfDay(parseDateValue(settlementRaw) || new Date());
+    const maturityRaw =
+      detail?.details?.maturity ??
+      detail?.overview?.maturityDate ??
+      selected?.MaturityDate;
+    const maturityDate = parseDateValue(maturityRaw);
+    if (!maturityDate) return null;
+
+    const accrualStartRaw = detail?.details?.couponInfo?.accruedInterestFromDate;
+    let accrualStart = parseDateValue(accrualStartRaw);
+    if (!accrualStart) {
+      const nextCouponSchedule = buildCashflowScheduleFromRedemption({
+        redemptionDate: maturityDate,
+        frequency,
+        notional: 100,
+        couponRate,
+        settlementDate
+      });
+      if (nextCouponSchedule.length > 0) {
+        const nextCouponDate = nextCouponSchedule[0].date;
+        const monthsStep = Math.max(1, Math.round(12 / frequency));
+        accrualStart = addMonths(nextCouponDate, -monthsStep);
+      }
+    }
+    accrualStart = alignAccrualStart({
+      accrualStart,
+      settlementDate,
+      frequency
+    });
+
+    const accrued = computeAccruedInterest({
+      couponRate,
+      notional: 100,
+      accrualStart,
+      settlementDate
+    });
+    const dirtyPrice = Number.isFinite(accrued) ? cleanPrice + accrued : null;
+
+    const maturitySchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: maturityDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    const cleanYtm = computeYieldFromSchedule({
+      price: cleanPrice,
+      schedule: maturitySchedule,
+      settlementDate
+    });
+    const dirtyYtm = Number.isFinite(dirtyPrice)
+      ? computeYieldFromSchedule({
+          price: dirtyPrice,
+          schedule: maturitySchedule,
+          settlementDate
+        })
+      : null;
+
+    const callRaw = detail?.details?.earliestRedemptionDate;
+    const callDate = parseDateValue(callRaw);
+    let cleanYtw = cleanYtm;
+    let dirtyYtw = dirtyYtm;
+    if (callDate && callDate > settlementDate) {
+      const callSchedule = buildCashflowScheduleFromRedemption({
+        redemptionDate: callDate,
+        frequency,
+        notional: 100,
+        couponRate,
+        settlementDate
+      });
+      const cleanYtc = computeYieldFromSchedule({
+        price: cleanPrice,
+        schedule: callSchedule,
+        settlementDate
+      });
+      const dirtyYtc = Number.isFinite(dirtyPrice)
+        ? computeYieldFromSchedule({
+            price: dirtyPrice,
+            schedule: callSchedule,
+            settlementDate
+          })
+        : null;
+      cleanYtw = minIgnoreNull(cleanYtc, cleanYtm);
+      dirtyYtw = minIgnoreNull(dirtyYtc, dirtyYtm);
+    }
+
+    return {
+      priceLabel,
+      cleanPrice,
+      dirtyPrice,
+      accrued,
+      settlementDate,
+      maturityDate,
+      callDate,
+      cleanYtm,
+      dirtyYtm,
+      cleanYtw,
+      dirtyYtw
+    };
+  }, [selected, pricing, bondInputs, detail]);
+
+  const govCurveYield = useMemo(() => {
+    if (!curve?.points || !Number.isFinite(bondInputs.years)) return null;
+    return interpolateCurveYield(curve.points, bondInputs.years);
+  }, [curve, bondInputs.years]);
+
+  const impliedGovCurveYield = useMemo(() => {
+    if (!Number.isFinite(bondInputs.years)) return null;
+    const fitPoints = govCurve?.fits?.spline?.length
+      ? govCurve.fits.spline
+      : govCurve?.points || [];
+    if (!fitPoints || fitPoints.length === 0) return null;
+    return interpolateCurveYield(fitPoints, bondInputs.years);
+  }, [govCurve, bondInputs.years]);
+
+  const govSpreadByYtw = useMemo(() => {
+    if (!Number.isFinite(pricing.yieldToWorst) || !Number.isFinite(govCurveYield)) {
+      return null;
+    }
+    return (pricing.yieldToWorst - govCurveYield) * 100;
+  }, [pricing.yieldToWorst, govCurveYield]);
+
+  const govSpreadBySchedule = useMemo(() => {
+    const scheduleYield =
+      actualYieldMetrics?.dirtyYtw ??
+      actualYieldMetrics?.dirtyYtm ??
+      actualYieldMetrics?.cleanYtw ??
+      actualYieldMetrics?.cleanYtm;
+    if (!Number.isFinite(scheduleYield) || !Number.isFinite(govCurveYield)) {
+      return null;
+    }
+    return (scheduleYield - govCurveYield) * 100;
+  }, [actualYieldMetrics, govCurveYield]);
+
+  const impliedGovSpreadByYtw = useMemo(() => {
+    if (!Number.isFinite(pricing.yieldToWorst) || !Number.isFinite(impliedGovCurveYield)) {
+      return null;
+    }
+    return (pricing.yieldToWorst - impliedGovCurveYield) * 100;
+  }, [pricing.yieldToWorst, impliedGovCurveYield]);
+
+  const impliedGovSpreadTooltip = useMemo(() => {
+    return formatImpliedGovSpreadTooltip({
+      yieldToWorst: pricing.yieldToWorst,
+      govYield: impliedGovCurveYield,
+      source: govCurve?.fits?.spline?.length ? "PCHIP fit" : "implied points"
+    });
+  }, [pricing.yieldToWorst, impliedGovCurveYield, govCurve]);
+
+  const govSpreadByYtwTooltip = useMemo(() => {
+    if (!Number.isFinite(govCurveYield)) return "Curve yield unavailable.";
+    return [
+      `YieldToWorst (SIX): ${formatPercent(pricing.yieldToWorst, 2)}`,
+      `Gov curve yield: ${formatPercent(govCurveYield, 2)}`,
+      `Curve date: ${curve?.latest_date || "-"}`,
+      "Spread = (YieldToWorst - gov curve)."
+    ].join("\n");
+  }, [pricing.yieldToWorst, govCurveYield, curve?.latest_date]);
+
+  const govSpreadByScheduleTooltip = useMemo(() => {
+    if (!actualYieldMetrics) return "Schedule-based yield unavailable.";
+    const scheduleYield =
+      actualYieldMetrics.dirtyYtw ??
+      actualYieldMetrics.dirtyYtm ??
+      actualYieldMetrics.cleanYtw ??
+      actualYieldMetrics.cleanYtm;
+    return [
+      `Price basis: ${actualYieldMetrics.priceLabel || "-"}`,
+      `Clean: ${formatNumber(actualYieldMetrics.cleanPrice, 2)} / Dirty: ${formatNumber(
+        actualYieldMetrics.dirtyPrice,
+        4
+      )}`,
+      `Schedule yield: ${formatPercent(scheduleYield, 2)}`,
+      `Gov curve yield: ${formatPercent(govCurveYield, 2)}`,
+      `Curve date: ${curve?.latest_date || "-"}`,
+      "Spread = (schedule yield - gov curve)."
+    ].join("\n");
+  }, [actualYieldMetrics, govCurveYield, curve?.latest_date]);
+
+  const actualTimingScenarioLast = useMemo(() => {
+    if (!actualYieldMetrics) return null;
+    const priceDirty = Number.isFinite(actualYieldMetrics.dirtyPrice)
+      ? actualYieldMetrics.dirtyPrice
+      : actualYieldMetrics.cleanPrice;
+    if (!Number.isFinite(priceDirty) || !actualYieldMetrics.maturityDate) return null;
+
+    const couponRate = bondInputs.couponRate || 0;
+    const frequency = bondInputs.frequency || 1;
+    const settlementDate = actualYieldMetrics.settlementDate;
+    const maturitySchedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: actualYieldMetrics.maturityDate,
+      frequency,
+      notional,
+      couponRate,
+      settlementDate
+    });
+    const maturityScenario = buildActualScenarioForSchedule({
+      pricePer100: priceDirty,
+      schedule: maturitySchedule,
+      settlementDate,
+      notional,
+      couponRate,
+      taxRate: taxRate / 100,
+      fees: feeInputs
+    });
+
+    let chosenScenario = maturityScenario;
+    if (actualYieldMetrics.callDate && actualYieldMetrics.callDate > settlementDate) {
+      const callSchedule = buildCashflowScheduleFromRedemption({
+        redemptionDate: actualYieldMetrics.callDate,
+        frequency,
+        notional,
+        couponRate,
+        settlementDate
+      });
+      const callScenario = buildActualScenarioForSchedule({
+        pricePer100: priceDirty,
+        schedule: callSchedule,
+        settlementDate,
+        notional,
+        couponRate,
+        taxRate: taxRate / 100,
+        fees: feeInputs
+      });
+      if (callScenario && Number.isFinite(callScenario.grossIrr)) {
+        if (!chosenScenario || !Number.isFinite(chosenScenario.grossIrr)) {
+          chosenScenario = callScenario;
+        } else if (callScenario.grossIrr < chosenScenario.grossIrr) {
+          chosenScenario = callScenario;
+        }
+      }
+    }
+
+    return chosenScenario;
+  }, [actualYieldMetrics, bondInputs, notional, feeInputs, taxRate]);
+
+  const riskFreeMetrics = useMemo(() => {
+    if (!actualYieldMetrics || !selected) return null;
+    const couponRate = bondInputs.couponRate || 0;
+    const frequency = bondInputs.frequency || 1;
+    const settlementDate = actualYieldMetrics.settlementDate;
+    const maturityDate = actualYieldMetrics.maturityDate;
+    if (!maturityDate || !settlementDate) return null;
+
+    const pricePer100 = Number.isFinite(actualYieldMetrics.dirtyPrice)
+      ? actualYieldMetrics.dirtyPrice
+      : actualYieldMetrics.cleanPrice;
+    if (!Number.isFinite(pricePer100)) return null;
+
+    const schedule = buildCashflowScheduleFromRedemption({
+      redemptionDate: maturityDate,
+      frequency,
+      notional: 100,
+      couponRate,
+      settlementDate
+    });
+    const yieldRate =
+      actualYieldMetrics.dirtyYtm ??
+      actualYieldMetrics.cleanYtm ??
+      computeYieldFromSchedule({
+        price: pricePer100,
+        schedule,
+        settlementDate
+      });
+
+    const duration = computeDurationFromSchedule({
+      pricePer100,
+      schedule,
+      settlementDate,
+      yieldRate
+    });
+    const modDuration = duration?.modified ?? null;
+    const priceValue = (pricePer100 / 100) * notional;
+    const pnlForShift = (bps) =>
+      modDuration ? -modDuration * (bps / 10000) * priceValue : null;
+
+    const breakEvenShift = computeOneYearBreakEvenShift({
+      pricePer100,
+      schedule,
+      settlementDate,
+      yieldRate,
+      duration: modDuration
+    });
+
+    return {
+      modDuration,
+      macaulay: duration?.macaulay ?? null,
+      pnlPlus100: pnlForShift(100),
+      pnlMinus100: pnlForShift(-100),
+      pnlPlus25: pnlForShift(25),
+      pnlMinus25: pnlForShift(-25),
+      breakEvenShift
+    };
+  }, [actualYieldMetrics, bondInputs, notional, selected]);
+
   const cashflowSchedule = useMemo(() => {
     const details = detail?.details || {};
     const overview = detail?.overview || {};
@@ -1744,17 +3586,49 @@ export default function App() {
       return rows;
     }
 
-    const purchaseTotal = -((price / 100) * notional);
+    const market = detail?.market || {};
+    const settlementRaw = market.MarketDate ?? market.LatestTradeDate ?? selected?.MarketDate;
+    const settlementDate = startOfDay(parseDateValue(settlementRaw) || new Date());
+    const frequency = bondInputs.frequency || 1;
+    let accrualStart = parseDateValue(detail?.details?.couponInfo?.accruedInterestFromDate);
+    if (!accrualStart && cashflowSchedule.length > 0) {
+      const nextCouponDate = cashflowSchedule[0].date;
+      const monthsStep = Math.max(1, Math.round(12 / frequency));
+      accrualStart = addMonths(nextCouponDate, -monthsStep);
+    }
+    accrualStart = alignAccrualStart({
+      accrualStart,
+      settlementDate,
+      frequency
+    });
+    const accruedPer100 = computeAccruedInterest({
+      couponRate: bondInputs.couponRate || 0,
+      notional: 100,
+      accrualStart,
+      settlementDate
+    });
+    const cleanValue = (price / 100) * notional;
+    const accruedValue = Number.isFinite(accruedPer100)
+      ? (accruedPer100 / 100) * notional
+      : null;
+    const dirtyValue =
+      cleanValue + (Number.isFinite(accruedValue) ? accruedValue : 0);
+
+    const purchaseTotal = -dirtyValue;
+    const breakdown =
+      Number.isFinite(accruedValue) && Math.abs(accruedValue) > 0
+        ? `dirty = ${formatCurrency(cleanValue, 2)} + ${formatCurrency(accruedValue, 2)}`
+        : `dirty = ${formatCurrency(cleanValue, 2)}`;
     const purchaseRow = {
       date: startOfDay(new Date()),
       coupon: 0,
       principal: 0,
       total: purchaseTotal,
       isMaturity: false,
-      type: `Purchase (${priceLabel})`
+      type: `Purchase (${priceLabel}, ${breakdown})`
     };
     return [purchaseRow, ...rows];
-  }, [cashflowSchedule, pricing, notional]);
+  }, [cashflowSchedule, pricing, notional, bondInputs, detail, selected]);
 
   const scenarioAsk = useMemo(() => {
     if (!selected) return null;
@@ -2245,6 +4119,22 @@ export default function App() {
               />
             </label>
             <label>
+              Sector
+              <select
+                value={filters.industrySector}
+                onChange={(event) =>
+                  setFilters({ ...filters, industrySector: event.target.value })
+                }
+              >
+                <option value="">All</option>
+                {sectorOptions.map((sector) => (
+                  <option key={sector} value={sector}>
+                    {sector}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
               Results per page
               <input
                 type="number"
@@ -2277,7 +4167,7 @@ export default function App() {
             className="ghost"
             onClick={() => setShowChart((prev) => !prev)}
           >
-            {showChart ? "Hide chart" : "Show chart"}
+            {showChart ? "Hide Charts" : "View Charts"}
           </button>
         </div>
         {showChart ? (
@@ -2296,6 +4186,103 @@ export default function App() {
             )}
           </div>
         ) : null}
+        {showChart ? (
+          <div className="chart-card">
+            <div className="chart-header">
+              <h3>Maturity vs after-tax yield</h3>
+              <span>{afterTaxChartData.points.length} bonds plotted</span>
+            </div>
+            {afterTaxChartData.points.length === 0 ? (
+              <p className="meta">No after-tax yield data available.</p>
+            ) : (
+              <ScatterPlot
+                data={afterTaxChartData}
+                onPointClick={(bond) => openDetails(bond)}
+                yLabel="After-tax yield (%)"
+              />
+            )}
+          </div>
+        ) : null}
+        {showChart ? (
+          <div className="chart-card">
+            <div className="chart-header">
+              <h3>S&amp;P rating vs after-tax yield</h3>
+              <span>{ratingChartData.points.length} bonds plotted</span>
+            </div>
+            {ratingChartData.points.length === 0 ? (
+              <p className="meta">No S&amp;P ratings with after-tax yield available.</p>
+            ) : (
+              <RatingScatterPlot
+                data={ratingChartData}
+                onPointClick={(bond) => openDetails(bond)}
+                xLabel="S&P rating"
+                yLabel="After-tax yield (%)"
+              />
+            )}
+          </div>
+        ) : null}
+        {showChart ? (
+          <div className="chart-card">
+            <div className="chart-header">
+              <h3>S&amp;P rating vs ask yield</h3>
+              <span>{ratingAskChartData.points.length} bonds plotted</span>
+            </div>
+            {ratingAskChartData.points.length === 0 ? (
+              <p className="meta">No S&amp;P ratings with ask yield available.</p>
+            ) : (
+              <RatingScatterPlot
+                data={ratingAskChartData}
+                onPointClick={(bond) => openDetails(bond)}
+                xLabel="S&P rating"
+                yLabel="Ask yield (%)"
+              />
+            )}
+          </div>
+        ) : null}
+        {showChart ? (
+          <div className="chart-card">
+            <div className="chart-header">
+              <h3>Gross IRR vs SIX ask yield</h3>
+              <span>{grossIrrAskYieldChart.points.length} bonds plotted</span>
+            </div>
+            {grossIrrChartLoading ? (
+              <p className="meta">Loading gross IRR points...</p>
+            ) : null}
+            {grossIrrChartError ? <p className="error">{grossIrrChartError}</p> : null}
+            {!grossIrrChartLoading && grossIrrAskYieldChart.points.length === 0 ? (
+              <p className="meta">No gross IRR data available yet.</p>
+            ) : null}
+            {!grossIrrChartLoading && grossIrrAskYieldChart.points.length > 0 ? (
+              <XYScatterPlot
+                data={grossIrrAskYieldChart}
+                onPointClick={(bond) => openDetails(bond)}
+                xLabel="Gross IRR (%)"
+                yLabel="SIX ask yield (%)"
+              />
+            ) : null}
+          </div>
+        ) : null}
+        {showChart ? (
+          <div className="chart-card">
+            <div className="chart-header">
+              <h3>Avg bid/ask spread distribution (last 5 days)</h3>
+              <span>{liquidityViolinData.points.length} bonds plotted</span>
+            </div>
+            {grossIrrChartLoading ? (
+              <p className="meta">Loading liquidity spreads...</p>
+            ) : null}
+            {!grossIrrChartLoading && liquidityViolinData.points.length === 0 ? (
+              <p className="meta">No liquidity spread history available yet.</p>
+            ) : null}
+            {!grossIrrChartLoading && liquidityViolinData.points.length > 0 ? (
+              <ViolinPlot
+                data={liquidityViolinData}
+                onPointClick={(bond) => openDetails(bond)}
+                yLabel="Avg spread (%)"
+              />
+            ) : null}
+          </div>
+        ) : null}
         <div className="chart-card">
           <div className="chart-header">
             <h3>SNB Swiss government curve</h3>
@@ -2303,14 +4290,48 @@ export default function App() {
               {curve?.latest_date ? `Latest ${curve.latest_date}` : "Latest curve"}
             </span>
           </div>
-          {curveLoading ? <p className="meta">Loading curve...</p> : null}
+          <div className="curve-legend">
+            <div className="legend-item">
+              <span className="legend-swatch snb" />
+              <span>SNB curve</span>
+            </div>
+            <div className="legend-item">
+              <span className="legend-swatch gov" />
+              <span>Implied gov (raw)</span>
+            </div>
+            <div className="legend-item">
+              <span className="legend-swatch spline" />
+              <span>PCHIP fit</span>
+            </div>
+            <div className="legend-item">
+              <span className="legend-swatch nelson" />
+              <span>Nelson–Siegel fit</span>
+            </div>
+          </div>
+          {curveLoading || govCurveLoading ? (
+            <p className="meta">Loading curve...</p>
+          ) : null}
           {curveError ? <p className="error">{curveError}</p> : null}
+          {govCurveError && !(govCurve?.points && govCurve.points.length > 0) ? (
+            <p className="error">{govCurveError}</p>
+          ) : null}
           {!curveLoading && !curveError ? (
             curve?.points && curve.points.length > 1 ? (
-              <CurveChart points={curve.points} />
+              <CurveChart
+                points={curve.points}
+                govPoints={govCurve?.points}
+                govFits={govCurve?.fits}
+                onPointClick={(bond) => openDetails(bond)}
+              />
             ) : (
               <p className="meta">No SNB curve data available.</p>
             )
+          ) : null}
+          {govCurve?.points && govCurve.points.length > 0 ? (
+            <p className="meta">
+              Implied curve from {govCurve.count || govCurve.points.length} Swiss
+              Confederation bonds (dashed). PCHIP fit in teal, Nelson–Siegel in green.
+            </p>
           ) : null}
         </div>
         <div className="table-wrap results-table">
@@ -2372,6 +4393,15 @@ export default function App() {
                     Bond{sortIndicator("ShortName")}
                   </button>
                 </th>
+                <th aria-sort={sortState.key === "IndustrySectorDesc" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("IndustrySectorDesc")}
+                  >
+                    Sector{sortIndicator("IndustrySectorDesc")}
+                  </button>
+                </th>
                 <th aria-sort={sortState.key === "MaturityDate" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
                   <button
                     type="button"
@@ -2423,7 +4453,16 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("GovSpreadBps")}
                   >
-                    Gov spread (bps){sortIndicator("GovSpreadBps")}
+                    Gov spread (YTW bps){sortIndicator("GovSpreadBps")}
+                  </button>
+                </th>
+                <th aria-sort={sortState.key === "ImpliedGovSpreadBps" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("ImpliedGovSpreadBps")}
+                  >
+                    Implied spread (YTW bps){sortIndicator("ImpliedGovSpreadBps")}
                   </button>
                 </th>
                 <th>Info</th>
@@ -2511,6 +4550,7 @@ export default function App() {
                     })()}
                   </td>
                   <td>{bond.ShortName || "-"}</td>
+                  <td>{bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}</td>
                   <td>
                     <div className="term-stack">
                       <span>{formatDurationYears(maturityYearsFromValue(bond.MaturityDate))}</span>
@@ -2567,16 +4607,36 @@ export default function App() {
                       return "-";
                     })()}
                   </td>
-                  <td>
-                    {Number.isFinite(parseNumber(bond.GovSpreadBps)) ? (
-                      <MetricInline
-                        label={`${formatNumber(parseNumber(bond.GovSpreadBps), 1)} bps`}
-                        tooltip={formatGovSpreadTooltip(bond.GovSpreadMeta)}
-                      />
-                    ) : (
-                      "-"
-                    )}
-                  </td>
+                <td>
+                  {Number.isFinite(parseNumber(govSpreadYtwMap[bond.ValorId]?.spread)) ? (
+                    <MetricInline
+                      label={`${formatNumber(govSpreadYtwMap[bond.ValorId].spread, 1)} bps`}
+                      tooltip={formatGovSpreadYtwTooltip({
+                        yieldToWorst: govSpreadYtwMap[bond.ValorId]?.yieldToWorst,
+                        govYield: govSpreadYtwMap[bond.ValorId]?.govYield,
+                        curveDate: curve?.latest_date
+                      })}
+                    />
+                  ) : (
+                    "-"
+                  )}
+                </td>
+                <td>
+                  {Number.isFinite(
+                    parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread)
+                  ) ? (
+                    <MetricInline
+                      label={`${formatNumber(impliedGovSpreadMap[bond.ValorId].spread, 1)} bps`}
+                      tooltip={formatImpliedGovSpreadTooltip({
+                        yieldToWorst: impliedGovSpreadMap[bond.ValorId]?.yieldToWorst,
+                        govYield: impliedGovSpreadMap[bond.ValorId]?.govYield,
+                        source: impliedGovSpreadMap[bond.ValorId]?.source
+                      })}
+                    />
+                  ) : (
+                    "-"
+                  )}
+                </td>
                   <td>
                     <button type="button" className="ghost" onClick={() => openDetails(bond)}>
                       Info
@@ -2595,7 +4655,7 @@ export default function App() {
               ))}
               {!loading && bonds.length === 0 ? (
                 <tr>
-                  <td colSpan="14" className="empty">
+                  <td colSpan="15" className="empty">
                     No bonds found for the current filter.
                   </td>
                 </tr>
@@ -2771,6 +4831,7 @@ export default function App() {
                     <tr>
                       <th>Issuer</th>
                       <th>Bond</th>
+                      <th>Sector</th>
                       <th>Maturity</th>
                       <th>Yield ({portfolioBasisLabel})</th>
                       <th>Price ({portfolioBasisLabel})</th>
@@ -2822,6 +4883,7 @@ export default function App() {
                         <tr key={holding.valorId}>
                           <td>{bond.IssuerNameFull || "-"}</td>
                           <td>{bond.ShortName || "-"}</td>
+                          <td>{bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}</td>
                           <td>{formatDateYMD(bond.MaturityDate)}</td>
                           <td>{formatPercent(inputs.yieldToWorst, 2)}</td>
                           <td>{formatNumber(inputs.price, 2)}</td>
@@ -3155,6 +5217,14 @@ export default function App() {
                     <strong>{detail.overview?.isin || "-"}</strong>
                   </div>
                   <div>
+                    <span>Industry sector</span>
+                    <strong>
+                      {selected?.IndustrySectorDesc ||
+                        selected?.IndustrySectorCode ||
+                        "-"}
+                    </strong>
+                  </div>
+                  <div>
                     <span>Issuer country</span>
                     <strong>{detail.details?.issuerCountryCode || "-"}</strong>
                   </div>
@@ -3187,6 +5257,13 @@ export default function App() {
                   <div>
                     <span>Remaining life</span>
                     <strong>{formatDurationYears(bondInputs.years)}</strong>
+                  </div>
+                  <div>
+                    <span className="metric-label-inline">
+                      Duration (yrs)
+                      <InfoTooltip text="Approx. modified duration using 30E/360 cashflow timing and dirty YTM (ignores calls)." />
+                    </span>
+                    <strong>{formatNumber(riskFreeMetrics?.modDuration, 2)}</strong>
                   </div>
                   <div>
                     <span>Interest method</span>
@@ -3252,19 +5329,83 @@ export default function App() {
                     </strong>
                   </div>
                   <div>
-                    <span>Gov spread (bps)</span>
+                    <span className="metric-label-inline">
+                      Gov spread (YTW, bps)
+                      <InfoTooltip text={govSpreadByYtwTooltip} />
+                    </span>
                     <strong>
-                      {Number.isFinite(parseNumber(detail.gov_spread_bps)) ? (
-                        <MetricInline
-                          label={`${formatNumber(parseNumber(detail.gov_spread_bps), 1)} bps`}
-                          tooltip={formatGovSpreadTooltip(detail.gov_spread_meta)}
-                        />
-                      ) : (
-                        "-"
+                      {Number.isFinite(govSpreadByYtw)
+                        ? `${formatNumber(govSpreadByYtw, 1)} bps`
+                        : "-"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="metric-label-inline">
+                      Implied spread (YTW, bps)
+                      <InfoTooltip text={impliedGovSpreadTooltip} />
+                    </span>
+                    <strong>
+                      {Number.isFinite(impliedGovSpreadByYtw)
+                        ? `${formatNumber(impliedGovSpreadByYtw, 1)} bps`
+                        : "-"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="metric-label-inline">
+                      Gov spread (schedule, bps)
+                      <InfoTooltip text={govSpreadByScheduleTooltip} />
+                    </span>
+                    <strong>
+                      {Number.isFinite(govSpreadBySchedule)
+                        ? `${formatNumber(govSpreadBySchedule, 1)} bps`
+                        : "-"}
+                    </strong>
+                  </div>
+                </div>
+              </section>
+
+              <section>
+                <h4>Risk-Free Rate Change Sensitivity</h4>
+                <div className="detail-list">
+                  <div>
+                    <span>Duration (yrs)</span>
+                    <strong>{formatNumber(riskFreeMetrics?.modDuration, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>P&L +100 bps</span>
+                    <strong>{formatCurrency(riskFreeMetrics?.pnlPlus100, 0)}</strong>
+                  </div>
+                  <div>
+                    <span>P&L -100 bps</span>
+                    <strong>{formatCurrency(riskFreeMetrics?.pnlMinus100, 0)}</strong>
+                  </div>
+                  <div>
+                    <span>P&L +25 bps</span>
+                    <strong>{formatCurrency(riskFreeMetrics?.pnlPlus25, 0)}</strong>
+                  </div>
+                  <div>
+                    <span>P&L -25 bps</span>
+                    <strong>{formatCurrency(riskFreeMetrics?.pnlMinus25, 0)}</strong>
+                  </div>
+                  <div>
+                    <span className="metric-label-inline">
+                      1Y break-even rate rise
+                      <InfoTooltip text="If market yields for similar bonds are ≤X% higher when you sell in ~12 months, your coupon income and the bond aging should about offset the price drop. Assumes a parallel shift, same credit quality, and no default." />
+                    </span>
+                    <strong>
+                      {formatPercent(
+                        Number.isFinite(riskFreeMetrics?.breakEvenShift)
+                          ? riskFreeMetrics.breakEvenShift * 100
+                          : null,
+                        2
                       )}
                     </strong>
                   </div>
                 </div>
+                <p className="meta">
+                  Assumptions: Parallel shift (no slope change). Credit spread unchanged.
+                  Coupons paid and not reinvested. No calls/exercise events.
+                </p>
               </section>
 
               <section className="calculator">
@@ -3320,47 +5461,81 @@ export default function App() {
 
                 <div className="return-grid">
                   <div className="return-card">
+                    <h5>Yield (actual timing)</h5>
+                    <p>
+                      Price basis: {actualYieldMetrics?.priceLabel || "-"} (
+                      {formatNumber(actualYieldMetrics?.cleanPrice, 2)})
+                    </p>
+                    <p>
+                      Accrued interest (30E/360):{" "}
+                      {formatNumber(actualYieldMetrics?.accrued, 4)} → Dirty:{" "}
+                      {formatNumber(actualYieldMetrics?.dirtyPrice, 4)}
+                    </p>
+                    <p>
+                      Settlement date: {formatDateYMD(actualYieldMetrics?.settlementDate)}
+                    </p>
+                    <p>
+                      Call date: {formatDateYMD(actualYieldMetrics?.callDate) || "-"}
+                    </p>
+                    <p>
+                      Clean YTM: {formatPercent(actualYieldMetrics?.cleanYtm, 2)}
+                    </p>
+                    <p>
+                      Dirty YTM: {formatPercent(actualYieldMetrics?.dirtyYtm, 2)}
+                    </p>
+                    <p>
+                      Clean YTW (call): {formatPercent(actualYieldMetrics?.cleanYtw, 2)}
+                    </p>
+                    <p>
+                      Dirty YTW (call): {formatPercent(actualYieldMetrics?.dirtyYtw, 2)}
+                    </p>
+                  </div>
+                  <div className="return-card">
                     <h5>Last price</h5>
                     <p>
                       <MetricInline
                         label="Gross return"
                         tooltip={RETURN_TOOLTIPS.grossReturn}
                       />
-                      : {formatCurrency(scenarioLast?.grossAbs)}
+                      : {formatCurrency(actualTimingScenarioLast?.grossAbs)}
                     </p>
                     <p>
                       <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
-                      : {formatPercent(scenarioLast?.grossIrr, 2)}
+                      : {formatPercent(actualTimingScenarioLast?.grossIrr, 2)}
+                    </p>
+                    <p>
+                      <MetricInline label="SIX ask yield" tooltip="SIX Yield-to-Worst (ask yield)." />
+                      : {formatPercent(pricing.yieldToWorst, 2)}
                     </p>
                     <p>
                       <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
-                      {formatCurrency(scenarioLast?.feeAbs)}
+                      {formatCurrency(actualTimingScenarioLast?.feeAbs)}
                     </p>
                     <p>
                       <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
-                      {formatPercent(scenarioLast?.feeIrr, 2)}
+                      {formatPercent(actualTimingScenarioLast?.feeIrr, 2)}
                     </p>
                     <p>
                       <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
-                      {formatCurrency(scenarioLast?.taxAbs)}
+                      {formatCurrency(actualTimingScenarioLast?.taxAbs)}
                     </p>
                     <p>
                       <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
-                      {formatPercent(scenarioLast?.taxIrr, 2)}
+                      {formatPercent(actualTimingScenarioLast?.taxIrr, 2)}
                     </p>
                     <p>
                       <MetricInline
                         label="Break-even (fees)"
                         tooltip={RETURN_TOOLTIPS.breakEvenFees}
                       />
-                      : {formatDurationYears(scenarioLast?.breakEvenFees)}
+                      : {formatDurationYears(actualTimingScenarioLast?.breakEvenFees)}
                     </p>
                     <p>
                       <MetricInline
                         label="Break-even (fees + tax)"
                         tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
                       />
-                      : {formatDurationYears(scenarioLast?.breakEvenFeesTax)}
+                      : {formatDurationYears(actualTimingScenarioLast?.breakEvenFeesTax)}
                     </p>
                   </div>
                   <div className="return-card">

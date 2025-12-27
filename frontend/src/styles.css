@@ -412,16 +412,90 @@ button.ghost {
   stroke-width: 1.4;
 }
 
+.violin-shape {
+  fill: var(--accent);
+  opacity: 0.18;
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+
 .curve-line {
   fill: none;
-  stroke: var(--accent);
   stroke-width: 2;
+}
+
+.curve-line.snb {
+  stroke: #d36b2a;
+}
+
+.curve-line.gov {
+  stroke: #2b6cb0;
+  stroke-dasharray: 4 4;
+}
+
+.curve-line.spline {
+  stroke: #2f855a;
+  stroke-width: 2.2;
+  opacity: 0.9;
+}
+
+.curve-line.nelson {
+  stroke: #b45309;
+  stroke-dasharray: 6 4;
+  opacity: 0.85;
 }
 
 .curve-point {
   fill: var(--accent);
   stroke: #1b1b1b;
   stroke-width: 0.6;
+}
+
+.curve-point.gov {
+  fill: #2b6cb0;
+  stroke: #153e75;
+  cursor: pointer;
+}
+
+.curve-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 0.85rem;
+  color: #4b4b4b;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.legend-swatch {
+  width: 28px;
+  height: 0;
+  border-top: 3px solid currentColor;
+  display: inline-block;
+}
+
+.legend-swatch.snb {
+  color: #d36b2a;
+}
+
+.legend-swatch.gov {
+  color: #2b6cb0;
+  border-top-style: dashed;
+}
+
+.legend-swatch.spline {
+  color: #2f855a;
+}
+
+.legend-swatch.nelson {
+  color: #b45309;
+  border-top-style: dashed;
 }
 
 .tooltip rect {

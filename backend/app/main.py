@@ -24,16 +24,11 @@ from .six_client import (
     fetch_bond_market_data,
     fetch_bond_overview,
     fetch_bonds,
+    fetch_government_bonds,
     maturity_bucket_to_range,
 )
 from .snb_client import SnbClientError, fetch_snb_curve
-from .spread import (
-    compute_gov_spread_bps,
-    interpolate_curve_yield,
-    maturity_years_from_value,
-    parse_number,
-    build_spread_price_meta,
-)
+from .spread import build_gov_curve_fits, extract_curve_points_with_meta, parse_number
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +56,7 @@ ALLOWED_ORDER_FIELDS = {
     "IssuerNameFull",
     "YieldToWorst",
     "CouponRate",
+    "IndustrySectorCode",
 }
 
 
@@ -269,6 +265,7 @@ def bonds_search(
     maturity_bucket: str = Query("2-3", description="lt1, 1-2, 2-3, 3-5, 5-10, 10+"),
     currency: str = Query("CHF", min_length=1, max_length=6),
     country: str = Query("CH", min_length=1, max_length=6),
+    industry_sector: Optional[str] = Query(None, min_length=1, max_length=10),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     order_by: str = Query("MaturityDate"),
@@ -285,38 +282,30 @@ def bonds_search(
             page=page,
             page_size=page_size,
             order_by=order_by,
+            industry_sector=industry_sector,
         )
-        try:
-            snb_curve = fetch_snb_curve()
-            curve_points = snb_curve.get("points", [])
-        except SnbClientError:
-            curve_points = []
-        for item in response.get("items", []):
-            years = maturity_years_from_value(item.get("MaturityDate"))
-            price_meta = build_spread_price_meta(
-                ask=item.get("AskPrice"),
-                bid=item.get("BidPrice"),
-                close=item.get("ClosingPrice"),
-            )
-            gov_yield = (
-                interpolate_curve_yield(curve_points, years) if curve_points else None
-            )
-            item["GovSpreadBps"] = compute_gov_spread_bps(
-                price=price_meta.get("price"),
-                coupon_rate=item.get("CouponRate"),
-                years=years,
-                frequency=1,
-                curve_points=curve_points,
-            )
-            item["GovSpreadMeta"] = {
-                **price_meta,
-                "gov_yield": gov_yield,
-                "curve_date": snb_curve.get("latest_date") if curve_points else None,
-                "years": years,
-            }
         return response
-    except (SixClientError, SnbClientError) as exc:
+    except SixClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/bonds/gov-curve")
+def bonds_government_curve(
+    currency: str = Query("CHF", min_length=1, max_length=6),
+    country: str = Query("CH", min_length=1, max_length=6),
+) -> dict:
+    try:
+        bonds = fetch_government_bonds(currency=currency, country=country)
+    except SixClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    points = extract_curve_points_with_meta(bonds)
+    fits = build_gov_curve_fits(points)
+    return {
+        "points": points,
+        "count": len(bonds),
+        "fits": fits,
+    }
 
 
 @app.get("/api/bonds/{valor_id}")
@@ -326,31 +315,6 @@ def bond_details(valor_id: str) -> dict:
         details = fetch_bond_details(valor_id)
         liquidity = fetch_bond_liquidity(valor_id)
         market = fetch_bond_market_data(valor_id)
-        try:
-            snb_curve = fetch_snb_curve()
-            curve_points = snb_curve.get("points", [])
-        except SnbClientError:
-            curve_points = []
-        coupon_info = details.get("couponInfo", {})
-        years = parse_number(coupon_info.get("remainingLifeInYear"))
-        if years is None:
-            years = maturity_years_from_value(details.get("maturity") or overview.get("maturityDate"))
-        frequency = parse_number(coupon_info.get("interestFrequency")) or 1
-        price_meta = build_spread_price_meta(
-            ask=market.get("AskPrice"),
-            bid=market.get("BidPrice"),
-            close=market.get("PreviousClosingPrice"),
-        )
-        gov_yield = (
-            interpolate_curve_yield(curve_points, years) if curve_points else None
-        )
-        gov_spread_bps = compute_gov_spread_bps(
-            price=price_meta.get("price"),
-            coupon_rate=coupon_info.get("couponRate"),
-            years=years,
-            frequency=frequency,
-            curve_points=curve_points,
-        )
     except SixClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -363,11 +327,4 @@ def bond_details(valor_id: str) -> dict:
         "details": details,
         "market": market,
         "liquidity": liquidity,
-        "gov_spread_bps": gov_spread_bps,
-        "gov_spread_meta": {
-            **price_meta,
-            "gov_yield": gov_yield,
-            "curve_date": snb_curve.get("latest_date") if curve_points else None,
-            "years": years,
-        },
     }

@@ -1,4 +1,11 @@
-export async function fetchBonds({ maturityBucket, currency, country, page, pageSize }) {
+export async function fetchBonds({
+  maturityBucket,
+  currency,
+  country,
+  industrySector,
+  page,
+  pageSize
+}) {
   const params = new URLSearchParams({
     maturity_bucket: maturityBucket,
     currency,
@@ -6,6 +13,9 @@ export async function fetchBonds({ maturityBucket, currency, country, page, page
     page: String(page),
     page_size: String(pageSize)
   });
+  if (industrySector) {
+    params.set("industry_sector", industrySector);
+  }
   const response = await fetch(`/api/bonds/search?${params.toString()}`);
   if (!response.ok) {
     throw new Error(`Search failed (${response.status})`);
@@ -25,6 +35,14 @@ export async function fetchSnbCurve() {
   const response = await fetch("/api/snb/curve");
   if (!response.ok) {
     throw new Error(`Curve failed (${response.status})`);
+  }
+  return response.json();
+}
+
+export async function fetchGovBondCurve() {
+  const response = await fetch("/api/bonds/gov-curve");
+  if (!response.ok) {
+    throw new Error(`Gov curve failed (${response.status})`);
   }
   return response.json();
 }

@@ -24,6 +24,7 @@ LIST_FIELDS = [
     "IssuerNameFull",
     "ProductLine",
     "IndustrySectorCode",
+    "IndustrySectorDesc",
     "SecTypeCode",
     "ISIN",
     "AmountInIssue",
@@ -71,6 +72,7 @@ GOVERNMENT_ISSUER_NAMES = [
     "Swiss Confederation",
     "SCHWEIZERISCHE EIDGENOSSENSCHAFT",
     "Schweizerische Eidgenossenschaft",
+    "Schweiz. Eidgenossenschaft",
 ]
 
 
@@ -113,6 +115,7 @@ def _build_where(
     currency: Optional[str],
     maturity_from: Optional[int],
     maturity_to: Optional[int],
+    industry_sector: Optional[str] = None,
     issuer_name: Optional[str] = None,
 ) -> str:
     parts = ["PortalSegment=BO"]
@@ -120,6 +123,8 @@ def _build_where(
         parts.append(f"GeographicalAreaCode={country}")
     if currency:
         parts.append(f"TradingBaseCurrency={currency}")
+    if industry_sector:
+        parts.append(f"IndustrySectorCode={industry_sector}")
     if maturity_from:
         parts.append(f"MaturityDate>{maturity_from}")
     if maturity_to:
@@ -208,6 +213,7 @@ def fetch_bonds(
     page: int,
     page_size: int,
     order_by: str,
+    industry_sector: Optional[str] = None,
     issuer_name: Optional[str] = None,
 ) -> dict[str, Any]:
     where = _build_where(
@@ -215,6 +221,7 @@ def fetch_bonds(
         currency=currency,
         maturity_from=maturity_from,
         maturity_to=maturity_to,
+        industry_sector=industry_sector,
         issuer_name=issuer_name,
     )
     url = _build_fqs_url(
@@ -233,26 +240,24 @@ def fetch_bonds(
     }
 
 
-def fetch_government_bonds(currency: Optional[str]) -> list[dict[str, Any]]:
-    if not currency:
-        return []
-    collected: dict[str, dict[str, Any]] = {}
-    for issuer_name in GOVERNMENT_ISSUER_NAMES:
-        response = fetch_bonds(
-            country="CH",
-            currency=currency,
-            maturity_from=None,
-            maturity_to=None,
-            page=1,
-            page_size=200,
-            order_by="MaturityDate",
-            issuer_name=issuer_name,
-        )
-        for item in response.get("items", []):
-            key = str(item.get("ValorId") or item.get("ISIN") or "")
-            if key:
-                collected[key] = item
-    return list(collected.values())
+def fetch_government_bonds(
+    *,
+    currency: Optional[str] = "CHF",
+    country: Optional[str] = "CH",
+    page_size: int = 200,
+) -> list[dict[str, Any]]:
+    # IndustrySectorCode=016 corresponds to "Countries" on SIX.
+    response = fetch_bonds(
+        country=country,
+        currency=currency,
+        maturity_from=None,
+        maturity_to=None,
+        page=1,
+        page_size=page_size,
+        order_by="MaturityDate",
+        industry_sector="016",
+    )
+    return response.get("items", [])
 
 
 def fetch_bond_market_data(valor_id: str) -> dict[str, Any]:
