@@ -19,6 +19,13 @@ cd frontend
 bun install
 cd "$ROOT"
 
+if ss -ltnp | rg -q ":8080"; then
+  backend_pid=$(ss -ltnp | rg ":8080" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -n 1)
+  if [ -n "$backend_pid" ]; then
+    kill "$backend_pid" || true
+    sleep 1
+  fi
+fi
 pkill -f "uvicorn app.main:app" || true
 cd "$ROOT/backend"
 nohup ../.venv/bin/uvicorn app.main:app --reload --port 8080 --host 127.0.0.1 > ../.logs/backend.log 2>&1 &
