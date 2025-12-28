@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="/home/ubuntu/Projects/bondsscanner"
+export PATH="/home/ubuntu/.bun/bin:$PATH"
 
 cd "$ROOT"
 git pull --ff-only origin main
