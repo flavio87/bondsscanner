@@ -120,10 +120,12 @@ body {
 }
 
 .hero-card .label {
+  display: block;
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.08rem;
   color: #4d6a5d;
+  margin-bottom: 4px;
 }
 
 .filter-card {
