@@ -16,6 +16,7 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: ${{ secrets.TAILSCALE_TAGS }}
           args: --accept-routes
 
       - name: Output tailscaled log on failure
