@@ -20,10 +20,12 @@ bun install
 cd "$ROOT"
 
 pkill -f "uvicorn app.main:app" || true
-nohup .venv/bin/uvicorn app.main:app --reload --port 8080 --host 127.0.0.1 > .logs/backend.log 2>&1 &
+cd "$ROOT/backend"
+nohup ../.venv/bin/uvicorn app.main:app --reload --port 8080 --host 127.0.0.1 > ../.logs/backend.log 2>&1 &
 
 pkill -f "vite" || true
-nohup bun run dev -- --host 0.0.0.0 --port 5173 > .logs/frontend.log 2>&1 &
+cd "$ROOT/frontend"
+nohup bun run dev -- --host 0.0.0.0 --port 5173 > ../.logs/frontend.log 2>&1 &
 
 if [ -f ".env" ] && rg -q "^LLM_QUEUE_BACKEND=celery" ".env"; then
   pkill -f "celery -A app.celery_app" || true
