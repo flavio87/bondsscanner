@@ -378,9 +378,10 @@ function formatImpliedGovSpreadTooltip({ yieldToWorst, govYield, source }) {
   }
   return [
     `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
-    `Implied gov yield: ${formatPercent(govYield, 2)}`,
-    `Curve source: ${source || "implied gov curve"}`,
-    "Spread = (YieldToWorst - implied gov curve)."
+    `Gov curve yield (implied): ${formatPercent(govYield, 2)}`,
+    "Gov curve yield is estimated from the fitted Swiss Confederation curve, not an official quote.",
+    `Curve fit: ${source || "implied gov curve"}`,
+    "Spread (bps) = (YieldToWorst - implied gov curve) * 100."
   ].join("\n");
 }
 
@@ -408,6 +409,14 @@ function MetricInline({ label, tooltip }) {
       <InfoTooltip text={tooltip} />
     </span>
   );
+}
+
+function formatVolumeShort(value) {
+  if (!Number.isFinite(value)) return "-";
+  if (Math.abs(value) >= 1000) {
+    return `${formatNumber(value / 1000, 0)}k`;
+  }
+  return formatNumber(value, 0);
 }
 
 function SourcePopover({ sources }) {
@@ -4315,7 +4324,7 @@ export default function App() {
                     Ratings{sortIndicator("IssuerRating")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"} className="bond-col">
                   <button
                     type="button"
                     className="sortable-button"
@@ -4324,7 +4333,10 @@ export default function App() {
                     Bond{sortIndicator("ShortName")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "IndustrySectorDesc" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th
+                  className="sector-col"
+                  aria-sort={sortState.key === "IndustrySectorDesc" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
                   <button
                     type="button"
                     className="sortable-button"
@@ -4339,7 +4351,7 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("MaturityDate")}
                   >
-                    Term / Maturity{sortIndicator("MaturityDate")}
+                    Maturity{sortIndicator("MaturityDate")}
                   </button>
                 </th>
                 <th aria-sort={sortState.key === "CouponRate" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
@@ -4369,7 +4381,10 @@ export default function App() {
                     After-tax yield{sortIndicator("AfterTaxYield")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "DayVolume" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th
+                  className="day-vol-col"
+                  aria-sort={sortState.key === "DayVolume" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
                   <button
                     type="button"
                     className="sortable-button"
@@ -4384,7 +4399,7 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("ImpliedGovSpreadBps")}
                   >
-                    Implied spread (YTW bps){sortIndicator("ImpliedGovSpreadBps")}
+                    Gov spread{sortIndicator("ImpliedGovSpreadBps")}
                   </button>
                 </th>
                 <th>Info</th>
@@ -4407,7 +4422,7 @@ export default function App() {
                             className="ghost"
                             onClick={() => handleFetchIssuerRatings(issuerName)}
                           >
-                            Fetch ratings
+                            Fetch
                           </button>
                         );
                       }
@@ -4438,8 +4453,10 @@ export default function App() {
                       );
                     })()}
                   </td>
-                  <td>{bond.ShortName || "-"}</td>
-                  <td>{bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}</td>
+                  <td className="bond-col">{bond.ShortName || "-"}</td>
+                  <td className="sector-col">
+                    {bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}
+                  </td>
                   <td>
                     <div className="term-stack">
                       <span>{formatDurationYears(maturityYearsFromValue(bond.MaturityDate))}</span>
@@ -4458,7 +4475,7 @@ export default function App() {
                       "-"
                     )}
                   </td>
-                  <td>
+                  <td className="day-vol-col">
                     {(() => {
                       const totalVolume = parseNumber(bond.TotalVolume);
                       const entry = volumes[bond.ValorId];
@@ -4467,7 +4484,7 @@ export default function App() {
                         !(Number.isFinite(totalVolume) && totalVolume > 0) &&
                         Number.isFinite(fallback);
                       if (!useFallback && Number.isFinite(totalVolume)) {
-                        const label = formatNumber(totalVolume, 0);
+                        const label = formatVolumeShort(totalVolume);
                         return bond.MarketDate ? (
                           <MetricInline
                             label={label}
@@ -4478,7 +4495,7 @@ export default function App() {
                         );
                       }
                       if (useFallback) {
-                        const label = formatNumber(fallback, 0);
+                        const label = formatVolumeShort(fallback);
                         if (entry?.date) {
                           const sourceLabel = entry.source
                             ? ` (${entry.source.replace(/_/g, " ")})`
@@ -5216,7 +5233,7 @@ export default function App() {
                   </div>
                   <div>
                     <span className="metric-label-inline">
-                      Implied spread (YTW, bps)
+                      Gov spread (bps)
                       <InfoTooltip text={impliedGovSpreadTooltip} />
                     </span>
                     <strong>

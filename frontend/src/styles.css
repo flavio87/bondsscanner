@@ -548,8 +548,29 @@ button.ghost {
 
 .results-table th.rating-col,
 .results-table td.rating-col {
-  max-width: 200px;
-  width: 180px;
+  max-width: 170px;
+  width: 150px;
+}
+
+.results-table th.sector-col,
+.results-table td.sector-col {
+  white-space: normal !important;
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: manual;
+  max-width: 160px;
+  width: 160px;
+}
+
+.results-table th.day-vol-col,
+.results-table td.day-vol-col {
+  max-width: 90px;
+  width: 90px;
+}
+
+.results-table th.bond-col,
+.results-table td.bond-col {
+  display: none;
 }
 
 .results-table th:nth-child(1),
