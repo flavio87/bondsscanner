@@ -151,7 +151,12 @@ def _process_issuer_job(job: dict) -> dict:
 
     ratings_prompt = _build_ratings_prompt(issuer_name)
     ratings_plugins = None
-    if payload.get("ratings_use_web", True):
+    ratings_use_web = payload.get("ratings_use_web", True)
+    provider = (get_env("LLM_PROVIDER", "openrouter") or "openrouter").strip().lower()
+    if provider == "gemini" and ratings_use_web:
+        logger.info("DISABLE ratings web for provider=gemini issuer=%s", issuer_name)
+        ratings_use_web = False
+    if ratings_use_web:
         plugin = {
             "id": "web",
             "max_results": payload.get("ratings_web_max_results", 5),
@@ -164,7 +169,6 @@ def _process_issuer_job(job: dict) -> dict:
             plugin["search_prompt"] = search_prompt
         ratings_plugins = [plugin]
     ratings_start = time.monotonic()
-    ratings_use_web = payload.get("ratings_use_web", True)
     logger.info(
         "START ratings issuer=%s model=%s web=%s",
         issuer_name,
