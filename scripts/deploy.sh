@@ -37,6 +37,7 @@ nohup bun run dev -- --host 0.0.0.0 --port 5173 > ../.logs/frontend.log 2>&1 &
 
 if [ -f ".env" ] && rg -q "^LLM_QUEUE_BACKEND=celery" ".env"; then
   pkill -f "celery -A app.celery_app" || true
+  echo "=== celery restart $(date -u) ===" >> .logs/celery.log
   nohup .venv/bin/celery -A app.celery_app worker --loglevel=INFO --concurrency=3 -Q bonds > .logs/celery.log 2>&1 &
 fi
 
