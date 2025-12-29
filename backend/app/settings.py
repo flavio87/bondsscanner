@@ -2,6 +2,8 @@ from pathlib import Path
 from typing import Optional
 import os
 
+_ENVFILE_PREFIX = "__ENVFILE__"
+
 
 def load_env(path: Optional[Path] = None) -> None:
     if path is None:
@@ -21,7 +23,12 @@ def load_env(path: Optional[Path] = None) -> None:
         value = value.strip().strip("'").strip('"')
         if key:
             os.environ[key] = value
+            os.environ[f"{_ENVFILE_PREFIX}{key}"] = "1"
 
 
 def get_env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(key, default)
+
+
+def is_envfile_key(key: str) -> bool:
+    return os.environ.get(f"{_ENVFILE_PREFIX}{key}") == "1"

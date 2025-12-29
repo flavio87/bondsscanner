@@ -16,7 +16,7 @@ from .cache_db import (
     upsert_issuer_enrichment,
 )
 from .llm_client import LlmClientError, call_llm, extract_json
-from .settings import get_env
+from .settings import get_env, is_envfile_key
 from .celery_app import celery_app
 
 _worker_started = False
@@ -53,8 +53,10 @@ def _key_fingerprint(key: Optional[str]) -> str:
 
 
 def _key_source(key_name: str) -> str:
-    if key_name not in os.environ:
+    if is_envfile_key(key_name):
         return "envfile"
+    if key_name not in os.environ:
+        return "missing"
     return "env"
 
 
