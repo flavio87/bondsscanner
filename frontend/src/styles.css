@@ -120,10 +120,12 @@ body {
 }
 
 .hero-card .label {
+  display: block;
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.08rem;
   color: #4d6a5d;
+  margin-bottom: 4px;
 }
 
 .filter-card {
@@ -539,26 +541,55 @@ button.ghost {
   font-size: 0.82rem;
 }
 
-.results-table th:not(:nth-child(1)):not(:nth-child(5)),
-.results-table td:not(:nth-child(1)):not(:nth-child(5)) {
+.results-table th:not(:nth-child(1)):not(:nth-child(3)),
+.results-table td:not(:nth-child(1)):not(:nth-child(3)) {
   white-space: nowrap;
 }
 
 .results-table th.rating-col,
 .results-table td.rating-col {
-  max-width: 110px;
-  width: 110px;
+  max-width: 200px;
+  width: 180px;
 }
 
 .results-table th:nth-child(1),
 .results-table td:nth-child(1),
-.results-table th:nth-child(5),
-.results-table td:nth-child(5) {
+.results-table th:nth-child(3),
+.results-table td:nth-child(3) {
   white-space: normal;
   word-break: normal;
   overflow-wrap: anywhere;
   min-width: 180px;
   max-width: 240px;
+}
+
+.rating-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.rating-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.rating-pill-label {
+  color: #6c6258;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04rem;
+}
+
+.rating-pill-value {
+  font-weight: 600;
 }
 
 .term-stack {
