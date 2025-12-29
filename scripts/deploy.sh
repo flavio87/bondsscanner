@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="/home/ubuntu/Projects/bondsscanner"
 export PATH="/home/ubuntu/.bun/bin:$PATH"
+unset GEMINI_API_KEY OPENROUTER_API_KEY LLM_PROVIDER
 
 cd "$ROOT"
 git pull --ff-only origin main
