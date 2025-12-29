@@ -372,62 +372,16 @@ const RETURN_TOOLTIPS = {
     "(buyFee + sellFee) / (annualYieldValue - annualTax).\nannualTax = notional * (couponRate / 100) * tax."
 };
 
-function formatGovSpreadTooltip(meta) {
-  if (!meta) return "No spread data available.";
-  const price = parseNumber(meta.price);
-  const ask = parseNumber(meta.ask);
-  const bid = parseNumber(meta.bid);
-  const close = parseNumber(meta.close);
-  const govYield = parseNumber(meta.gov_yield);
-  const years = parseNumber(meta.years);
-  const source = meta.source || "unknown";
-  const curveDate = meta.curve_date || "unknown";
-  const askOk = Number.isFinite(ask) && ask > 0;
-  const bidOk = Number.isFinite(bid) && bid > 0;
-
-  let priceLine = "Price basis: ";
-  if (source === "mid" && askOk && bidOk) {
-    priceLine += `mid = (${formatNumber(ask, 2)} + ${formatNumber(bid, 2)}) / 2 = ${formatNumber(price, 2)}`;
-  } else if (source === "close" && Number.isFinite(close)) {
-    priceLine += `close = ${formatNumber(close, 2)}`;
-    if (askOk) {
-      priceLine += ` (ask ${formatNumber(ask, 2)}${bidOk ? `, bid ${formatNumber(bid, 2)}` : ""})`;
-    }
-  } else if (source === "ask" && Number.isFinite(ask)) {
-    priceLine += `ask = ${formatNumber(ask, 2)}`;
-  } else {
-    priceLine += "unavailable";
-  }
-
-  const yieldLine =
-    Number.isFinite(govYield) && Number.isFinite(years)
-      ? `Interpolated SNB gov yield @ ${formatNumber(years, 2)}y = ${formatPercent(govYield, 2)}`
-      : "Interpolated SNB gov yield unavailable";
-
-  return `${priceLine}\n${yieldLine}\nCurve date: ${curveDate}\nSpread solves PV(cashflows, curve + spread) = price.`;
-}
-
-function formatGovSpreadYtwTooltip({ yieldToWorst, govYield, curveDate }) {
-  if (!Number.isFinite(yieldToWorst) || !Number.isFinite(govYield)) {
-    return "No spread data available.";
-  }
-  return [
-    `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
-    `Gov curve yield: ${formatPercent(govYield, 2)}`,
-    `Curve date: ${curveDate || "-"}`,
-    "Spread = (YieldToWorst - gov curve)."
-  ].join("\n");
-}
-
 function formatImpliedGovSpreadTooltip({ yieldToWorst, govYield, source }) {
   if (!Number.isFinite(yieldToWorst) || !Number.isFinite(govYield)) {
     return "No spread data available.";
   }
   return [
     `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
-    `Implied gov yield: ${formatPercent(govYield, 2)}`,
-    `Curve source: ${source || "implied gov curve"}`,
-    "Spread = (YieldToWorst - implied gov curve)."
+    `Gov curve yield (implied): ${formatPercent(govYield, 2)}`,
+    "Gov curve yield is estimated from the fitted Swiss Confederation curve, not an official quote.",
+    `Curve fit: ${source || "implied gov curve"}`,
+    "Spread (bps) = (YieldToWorst - implied gov curve) * 100."
   ].join("\n");
 }
 
@@ -455,6 +409,14 @@ function MetricInline({ label, tooltip }) {
       <InfoTooltip text={tooltip} />
     </span>
   );
+}
+
+function formatVolumeShort(value) {
+  if (!Number.isFinite(value)) return "-";
+  if (Math.abs(value) >= 1000) {
+    return `${formatNumber(value / 1000, 0)}k`;
+  }
+  return formatNumber(value, 0);
 }
 
 function SourcePopover({ sources }) {
@@ -2241,24 +2203,6 @@ export default function App() {
     return map;
   }, [bonds, taxRate, grossIrrChartDetails]);
 
-  const govSpreadYtwMap = useMemo(() => {
-    const map = {};
-    if (!curve?.points || curve.points.length === 0) return map;
-    bonds.forEach((bond) => {
-      const years = maturityYearsFromValue(bond.MaturityDate);
-      const yieldToWorst = parseNumber(bond.YieldToWorst);
-      if (!Number.isFinite(years) || !Number.isFinite(yieldToWorst)) return;
-      const govYield = interpolateCurveYield(curve.points, years);
-      if (!Number.isFinite(govYield)) return;
-      map[bond.ValorId] = {
-        spread: (yieldToWorst - govYield) * 100,
-        govYield,
-        yieldToWorst
-      };
-    });
-    return map;
-  }, [bonds, curve]);
-
   const impliedGovSpreadMap = useMemo(() => {
     const map = {};
     const fitPoints = govCurve?.fits?.spline?.length
@@ -2406,6 +2350,39 @@ export default function App() {
     });
   };
 
+  const getIssuerRatingInfo = (issuerName) => {
+    if (!issuerName) return { status: "missing", values: [], rank: null };
+    const entry = issuerTableEnrichment[issuerName];
+    const status = entry?.status;
+    if (!entry || status === "missing" || status === "idle") {
+      return { status: "missing", values: [], rank: null };
+    }
+    if (status === "loading" || status === "queued") {
+      return { status: "loading", values: [], rank: null };
+    }
+    if (status === "error") {
+      return { status: "error", values: [], rank: null };
+    }
+    const moodys = normalizeMoodysRating(entry?.enrichment?.moodys);
+    const fitch = normalizeSpFitchRating(entry?.enrichment?.fitch);
+    const sp = normalizeSpFitchRating(entry?.enrichment?.sp);
+    const rankCandidates = [
+      moodysRatingRank(entry?.enrichment?.moodys),
+      spFitchRatingRank(entry?.enrichment?.fitch),
+      spFitchRatingRank(entry?.enrichment?.sp)
+    ].filter((rank) => rank !== null);
+    const values = [
+      moodys ? { agency: "Moody's", value: moodys } : null,
+      fitch ? { agency: "Fitch", value: fitch } : null,
+      sp ? { agency: "S&P", value: sp } : null
+    ].filter(Boolean);
+    return {
+      status: "ready",
+      values,
+      rank: rankCandidates.length ? Math.min(...rankCandidates) : null
+    };
+  };
+
   const sortedBonds = useMemo(() => {
     if (!sortState.key) return bonds;
     const direction = sortState.dir === "asc" ? 1 : -1;
@@ -2431,8 +2408,6 @@ export default function App() {
           return parseNumber(bond.AskPrice);
         case "BidPrice":
           return parseNumber(bond.BidPrice);
-        case "GovSpreadBps":
-          return parseNumber(govSpreadYtwMap[bond.ValorId]?.spread);
         case "ImpliedGovSpreadBps":
           return parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread);
         case "DayVolume":
@@ -2446,20 +2421,10 @@ export default function App() {
           }
         case "AfterTaxYield":
           return parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
-        case "MoodysRating": {
+        case "IssuerRating": {
           const issuerName = bond.IssuerNameFull || "";
-          const entry = issuerTableEnrichment[issuerName];
-          return moodysRatingRank(entry?.enrichment?.moodys);
-        }
-        case "FitchRating": {
-          const issuerName = bond.IssuerNameFull || "";
-          const entry = issuerTableEnrichment[issuerName];
-          return spFitchRatingRank(entry?.enrichment?.fitch);
-        }
-        case "SPRating": {
-          const issuerName = bond.IssuerNameFull || "";
-          const entry = issuerTableEnrichment[issuerName];
-          return spFitchRatingRank(entry?.enrichment?.sp);
+          const ratingInfo = getIssuerRatingInfo(issuerName);
+          return ratingInfo.rank;
         }
         default:
           return bond[sortState.key];
@@ -2490,7 +2455,6 @@ export default function App() {
     volumes,
     afterTaxYieldMap,
     issuerTableEnrichment,
-    govSpreadYtwMap,
     impliedGovSpreadMap
   ]);
 
@@ -4350,41 +4314,17 @@ export default function App() {
                 </th>
                 <th
                   className="rating-col"
-                  aria-sort={sortState.key === "MoodysRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                  aria-sort={sortState.key === "IssuerRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
                 >
                   <button
                     type="button"
                     className="sortable-button"
-                    onClick={() => handleSort("MoodysRating")}
+                    onClick={() => handleSort("IssuerRating")}
                   >
-                    Moody&apos;s{sortIndicator("MoodysRating")}
+                    Ratings{sortIndicator("IssuerRating")}
                   </button>
                 </th>
-                <th
-                  className="rating-col"
-                  aria-sort={sortState.key === "FitchRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
-                >
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("FitchRating")}
-                  >
-                    Fitch{sortIndicator("FitchRating")}
-                  </button>
-                </th>
-                <th
-                  className="rating-col"
-                  aria-sort={sortState.key === "SPRating" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
-                >
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("SPRating")}
-                  >
-                    S&amp;P{sortIndicator("SPRating")}
-                  </button>
-                </th>
-                <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"} className="bond-col">
                   <button
                     type="button"
                     className="sortable-button"
@@ -4393,7 +4333,10 @@ export default function App() {
                     Bond{sortIndicator("ShortName")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "IndustrySectorDesc" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th
+                  className="sector-col"
+                  aria-sort={sortState.key === "IndustrySectorDesc" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
                   <button
                     type="button"
                     className="sortable-button"
@@ -4408,7 +4351,7 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("MaturityDate")}
                   >
-                    Term / Maturity{sortIndicator("MaturityDate")}
+                    Maturity{sortIndicator("MaturityDate")}
                   </button>
                 </th>
                 <th aria-sort={sortState.key === "CouponRate" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
@@ -4438,7 +4381,10 @@ export default function App() {
                     After-tax yield{sortIndicator("AfterTaxYield")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "DayVolume" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <th
+                  className="day-vol-col"
+                  aria-sort={sortState.key === "DayVolume" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
                   <button
                     type="button"
                     className="sortable-button"
@@ -4447,22 +4393,13 @@ export default function App() {
                     Day vol{sortIndicator("DayVolume")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "GovSpreadBps" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("GovSpreadBps")}
-                  >
-                    Gov spread (YTW bps){sortIndicator("GovSpreadBps")}
-                  </button>
-                </th>
                 <th aria-sort={sortState.key === "ImpliedGovSpreadBps" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
                   <button
                     type="button"
                     className="sortable-button"
                     onClick={() => handleSort("ImpliedGovSpreadBps")}
                   >
-                    Implied spread (YTW bps){sortIndicator("ImpliedGovSpreadBps")}
+                    Gov spread{sortIndicator("ImpliedGovSpreadBps")}
                   </button>
                 </th>
                 <th>Info</th>
@@ -4477,23 +4414,22 @@ export default function App() {
                     {(() => {
                       const issuerName = bond.IssuerNameFull || "";
                       if (!issuerName) return "-";
-                      const entry = issuerTableEnrichment[issuerName];
-                      const status = entry?.status;
-                      if (!entry || status === "missing" || status === "idle") {
+                      const ratingInfo = getIssuerRatingInfo(issuerName);
+                      if (ratingInfo.status === "missing") {
                         return (
                           <button
                             type="button"
                             className="ghost"
                             onClick={() => handleFetchIssuerRatings(issuerName)}
                           >
-                            Fetch ratings
+                            Fetch
                           </button>
                         );
                       }
-                      if (status === "loading" || status === "queued") {
+                      if (ratingInfo.status === "loading") {
                         return "Fetching…";
                       }
-                      if (status === "error") {
+                      if (ratingInfo.status === "error") {
                         return (
                           <button
                             type="button"
@@ -4504,53 +4440,23 @@ export default function App() {
                           </button>
                         );
                       }
-                      const moodysRaw = entry?.enrichment?.moodys;
-                      const moodysValue = normalizeMoodysRating(moodysRaw);
-                      return moodysValue ? moodysValue : "null";
+                      if (!ratingInfo.values.length) return "—";
+                      return (
+                        <div className="rating-summary">
+                          {ratingInfo.values.map((rating) => (
+                            <span key={rating.agency} className="rating-pill">
+                              <span className="rating-pill-label">{rating.agency}</span>
+                              <span className="rating-pill-value">{rating.value}</span>
+                            </span>
+                          ))}
+                        </div>
+                      );
                     })()}
                   </td>
-                  <td className="rating-col">
-                    {(() => {
-                      const issuerName = bond.IssuerNameFull || "";
-                      if (!issuerName) return "-";
-                      const entry = issuerTableEnrichment[issuerName];
-                      const status = entry?.status;
-                      if (!entry || status === "missing" || status === "idle") {
-                        return "-";
-                      }
-                      if (status === "loading" || status === "queued") {
-                        return "Fetching…";
-                      }
-                      if (status === "error") {
-                        return "Error";
-                      }
-                      const fitchRaw = entry?.enrichment?.fitch;
-                      const fitchValue = normalizeSpFitchRating(fitchRaw);
-                      return fitchValue ? fitchValue : "null";
-                    })()}
+                  <td className="bond-col">{bond.ShortName || "-"}</td>
+                  <td className="sector-col">
+                    {bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}
                   </td>
-                  <td className="rating-col">
-                    {(() => {
-                      const issuerName = bond.IssuerNameFull || "";
-                      if (!issuerName) return "-";
-                      const entry = issuerTableEnrichment[issuerName];
-                      const status = entry?.status;
-                      if (!entry || status === "missing" || status === "idle") {
-                        return "-";
-                      }
-                      if (status === "loading" || status === "queued") {
-                        return "Fetching…";
-                      }
-                      if (status === "error") {
-                        return "Error";
-                      }
-                      const spRaw = entry?.enrichment?.sp;
-                      const spValue = normalizeSpFitchRating(spRaw);
-                      return spValue ? spValue : "null";
-                    })()}
-                  </td>
-                  <td>{bond.ShortName || "-"}</td>
-                  <td>{bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}</td>
                   <td>
                     <div className="term-stack">
                       <span>{formatDurationYears(maturityYearsFromValue(bond.MaturityDate))}</span>
@@ -4569,7 +4475,7 @@ export default function App() {
                       "-"
                     )}
                   </td>
-                  <td>
+                  <td className="day-vol-col">
                     {(() => {
                       const totalVolume = parseNumber(bond.TotalVolume);
                       const entry = volumes[bond.ValorId];
@@ -4578,7 +4484,7 @@ export default function App() {
                         !(Number.isFinite(totalVolume) && totalVolume > 0) &&
                         Number.isFinite(fallback);
                       if (!useFallback && Number.isFinite(totalVolume)) {
-                        const label = formatNumber(totalVolume, 0);
+                        const label = formatVolumeShort(totalVolume);
                         return bond.MarketDate ? (
                           <MetricInline
                             label={label}
@@ -4589,7 +4495,7 @@ export default function App() {
                         );
                       }
                       if (useFallback) {
-                        const label = formatNumber(fallback, 0);
+                        const label = formatVolumeShort(fallback);
                         if (entry?.date) {
                           const sourceLabel = entry.source
                             ? ` (${entry.source.replace(/_/g, " ")})`
@@ -4607,36 +4513,22 @@ export default function App() {
                       return "-";
                     })()}
                   </td>
-                <td>
-                  {Number.isFinite(parseNumber(govSpreadYtwMap[bond.ValorId]?.spread)) ? (
-                    <MetricInline
-                      label={`${formatNumber(govSpreadYtwMap[bond.ValorId].spread, 1)} bps`}
-                      tooltip={formatGovSpreadYtwTooltip({
-                        yieldToWorst: govSpreadYtwMap[bond.ValorId]?.yieldToWorst,
-                        govYield: govSpreadYtwMap[bond.ValorId]?.govYield,
-                        curveDate: curve?.latest_date
-                      })}
-                    />
-                  ) : (
-                    "-"
-                  )}
-                </td>
-                <td>
-                  {Number.isFinite(
-                    parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread)
-                  ) ? (
-                    <MetricInline
-                      label={`${formatNumber(impliedGovSpreadMap[bond.ValorId].spread, 1)} bps`}
-                      tooltip={formatImpliedGovSpreadTooltip({
-                        yieldToWorst: impliedGovSpreadMap[bond.ValorId]?.yieldToWorst,
-                        govYield: impliedGovSpreadMap[bond.ValorId]?.govYield,
-                        source: impliedGovSpreadMap[bond.ValorId]?.source
-                      })}
-                    />
-                  ) : (
-                    "-"
-                  )}
-                </td>
+                  <td>
+                    {Number.isFinite(
+                      parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread)
+                    ) ? (
+                      <MetricInline
+                        label={`${formatNumber(impliedGovSpreadMap[bond.ValorId].spread, 1)} bps`}
+                        tooltip={formatImpliedGovSpreadTooltip({
+                          yieldToWorst: impliedGovSpreadMap[bond.ValorId]?.yieldToWorst,
+                          govYield: impliedGovSpreadMap[bond.ValorId]?.govYield,
+                          source: impliedGovSpreadMap[bond.ValorId]?.source
+                        })}
+                      />
+                    ) : (
+                      "-"
+                    )}
+                  </td>
                   <td>
                     <button type="button" className="ghost" onClick={() => openDetails(bond)}>
                       Info
@@ -4655,7 +4547,7 @@ export default function App() {
               ))}
               {!loading && bonds.length === 0 ? (
                 <tr>
-                  <td colSpan="15" className="empty">
+                  <td colSpan="12" className="empty">
                     No bonds found for the current filter.
                   </td>
                 </tr>
@@ -5341,7 +5233,7 @@ export default function App() {
                   </div>
                   <div>
                     <span className="metric-label-inline">
-                      Implied spread (YTW, bps)
+                      Gov spread (bps)
                       <InfoTooltip text={impliedGovSpreadTooltip} />
                     </span>
                     <strong>
