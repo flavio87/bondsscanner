@@ -206,7 +206,8 @@ def call_llm(
 ) -> dict[str, Any]:
     provider = _get_provider()
     if provider == "gemini":
-        response = call_gemini(prompt, model=model, use_web=use_web)
+        # Gemini quota is sensitive; never enable web tooling for direct Gemini calls.
+        response = call_gemini(prompt, model=model, use_web=False)
         text = _extract_gemini_text(response)
         sources = _extract_gemini_sources(response)
         model_name = model or _get_gemini_model()
