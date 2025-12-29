@@ -153,10 +153,10 @@ def _process_issuer_job(job: dict) -> dict:
     ratings_plugins = None
     ratings_use_web = payload.get("ratings_use_web", True)
     provider = (get_env("LLM_PROVIDER", "openrouter") or "openrouter").strip().lower()
-    if provider == "gemini" and ratings_use_web:
-        logger.info("DISABLE ratings web for provider=gemini issuer=%s", issuer_name)
+    if provider != "openrouter" and ratings_use_web:
+        logger.info("DISABLE ratings web for provider=%s issuer=%s", provider, issuer_name)
         ratings_use_web = False
-    if ratings_use_web:
+    if provider == "openrouter" and ratings_use_web:
         plugin = {
             "id": "web",
             "max_results": payload.get("ratings_web_max_results", 5),
