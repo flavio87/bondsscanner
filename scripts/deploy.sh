@@ -41,10 +41,24 @@ fi
 
 for _ in {1..15}; do
   if curl -fsS http://127.0.0.1:8080/api/health >/dev/null; then
-    exit 0
+    break
   fi
   sleep 1
 done
 
-echo "Backend health check failed after restart" >&2
-exit 1
+if ! curl -fsS http://127.0.0.1:8080/api/health >/dev/null; then
+  echo "Backend health check failed after restart" >&2
+  exit 1
+fi
+
+for _ in {1..15}; do
+  if curl -fsS http://127.0.0.1:5173 >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+if ! curl -fsS http://127.0.0.1:5173 >/dev/null; then
+  echo "Frontend health check failed after restart" >&2
+  exit 1
+fi
