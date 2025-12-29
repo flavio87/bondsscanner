@@ -1,5 +1,7 @@
+import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -42,6 +44,18 @@ def _get_logger() -> logging.Logger:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
+
+
+def _key_fingerprint(key: Optional[str]) -> str:
+    if not key:
+        return "missing"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+
+
+def _key_source(key_name: str) -> str:
+    if key_name not in os.environ:
+        return "envfile"
+    return "env"
 
 
 def _coerce_bool(value: object) -> Optional[bool]:
@@ -108,7 +122,15 @@ def _process_issuer_job(job: dict) -> dict:
 
     profile_prompt = _build_profile_prompt(issuer_name, payload.get("context"))
     profile_start = time.monotonic()
-    logger.info("START profile issuer=%s model=%s", issuer_name, model or "default")
+    profile_key_fp = _key_fingerprint(get_env("GEMINI_API_KEY"))
+    profile_key_src = _key_source("GEMINI_API_KEY")
+    logger.info(
+        "START profile issuer=%s model=%s key_fp=%s key_src=%s",
+        issuer_name,
+        model or "default",
+        profile_key_fp,
+        profile_key_src,
+    )
     try:
         profile_result = call_llm(profile_prompt, model=model, use_web=False)
     except Exception as exc:
@@ -169,11 +191,15 @@ def _process_issuer_job(job: dict) -> dict:
             plugin["search_prompt"] = search_prompt
         ratings_plugins = [plugin]
     ratings_start = time.monotonic()
+    ratings_key_fp = _key_fingerprint(get_env("GEMINI_API_KEY"))
+    ratings_key_src = _key_source("GEMINI_API_KEY")
     logger.info(
-        "START ratings issuer=%s model=%s web=%s",
+        "START ratings issuer=%s model=%s web=%s key_fp=%s key_src=%s",
         issuer_name,
         model or "default",
         ratings_use_web,
+        ratings_key_fp,
+        ratings_key_src,
     )
     try:
         ratings_result = call_llm(
