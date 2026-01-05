@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+import ipaddress
+import secrets
 
 from .cache_db import (
     cleanup_stale_jobs,
@@ -15,16 +17,19 @@ from .cache_db import (
 )
 from .llm_queue import dispatch_job, get_job_status, start_worker
 from .llm_client import LlmClientError, call_llm, extract_json
-from .settings import load_env
+from .settings import get_env, load_env
 from .cache import TTLCache
 from .six_client import (
     SixClientError,
+    IctaxClientError,
+    extract_iup_flag,
     fetch_bond_details,
     fetch_bond_liquidity,
     fetch_bond_market_data,
     fetch_bond_overview,
     fetch_bonds,
     fetch_government_bonds,
+    fetch_ictax_security,
     maturity_bucket_to_range,
 )
 from .snb_client import SnbClientError, fetch_snb_curve
@@ -41,6 +46,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Versified Bonds API", lifespan=lifespan)
 
 VOLUME_CACHE = TTLCache(ttl_seconds=3600)
+GOV_CURVE_CACHE = TTLCache(ttl_seconds=6 * 60 * 60)
+TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+DOCKER_NET = ipaddress.ip_network("172.17.0.0/16")
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +70,75 @@ ALLOWED_ORDER_FIELDS = {
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+class AuthRequest(BaseModel):
+    password: str
+
+
+def _extract_client_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        first = forwarded_for.split(",")[0].strip()
+        if first:
+            return first
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else None
+
+
+def _is_tailscale_client(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address in TAILSCALE_NET
+
+
+def _is_docker_client(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address in DOCKER_NET
+
+
+def _auth_required(host: Optional[str]) -> bool:
+    password = get_env("PUBLIC_APP_PASSWORD")
+    if not password:
+        return False
+    if _is_tailscale_client(host):
+        return False
+    if _is_docker_client(host):
+        return False
+    return True
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request) -> dict[str, bool]:
+    host = _extract_client_ip(request)
+    required = _auth_required(host)
+    return {
+        "requires_auth": required,
+        "tailscale": _is_tailscale_client(host),
+        "docker": _is_docker_client(host),
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(request: Request, payload: AuthRequest) -> dict[str, str]:
+    host = _extract_client_ip(request)
+    if not _auth_required(host):
+        return {"status": "ok"}
+    password = get_env("PUBLIC_APP_PASSWORD") or ""
+    if not secrets.compare_digest(payload.password or "", password):
+        raise HTTPException(status_code=401, detail="Invalid password")
     return {"status": "ok"}
 
 
@@ -294,6 +371,11 @@ def bonds_government_curve(
     currency: str = Query("CHF", min_length=1, max_length=6),
     country: str = Query("CH", min_length=1, max_length=6),
 ) -> dict:
+    cache_key = f"{currency}:{country}"
+    cached = GOV_CURVE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         bonds = fetch_government_bonds(currency=currency, country=country)
     except SixClientError as exc:
@@ -301,11 +383,13 @@ def bonds_government_curve(
 
     points = extract_curve_points_with_meta(bonds)
     fits = build_gov_curve_fits(points)
-    return {
+    payload = {
         "points": points,
         "count": len(bonds),
         "fits": fits,
     }
+    GOV_CURVE_CACHE.set(cache_key, payload)
+    return payload
 
 
 @app.get("/api/bonds/{valor_id}")
@@ -327,4 +411,22 @@ def bond_details(valor_id: str) -> dict:
         "details": details,
         "market": market,
         "liquidity": liquidity,
+    }
+
+
+@app.get("/api/ictax/security")
+def ictax_security(
+    isin: str = Query(..., min_length=2, max_length=24),
+    maturity: Optional[str] = Query(None, min_length=4, max_length=16),
+) -> dict:
+    try:
+        data = fetch_ictax_security(isin, maturity)
+    except IctaxClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    iup = extract_iup_flag(data)
+    return {
+        "isin": isin,
+        "maturity": maturity,
+        "iup": iup,
+        "data": data,
     }

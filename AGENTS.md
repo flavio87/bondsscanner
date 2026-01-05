@@ -15,6 +15,7 @@
 
 ## Frontend
 - Vite dev server is used for local UI.
+- When Playwright runs in Docker, use `http://172.17.0.1:5173` to reach the Vite server.
 - Keep UI updates consistent with existing layout and styles.
 - Use tooltips sparingly; keep text short and precise.
 

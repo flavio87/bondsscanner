@@ -61,6 +61,17 @@ export async function fetchBondVolumes(ids) {
   return response.json();
 }
 
+export async function fetchIctaxSecurity({ isin, maturity }) {
+  const params = new URLSearchParams();
+  params.set("isin", isin);
+  if (maturity) params.set("maturity", maturity);
+  const response = await fetch(`/api/ictax/security?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(`ICTax lookup failed (${response.status})`);
+  }
+  return response.json();
+}
+
 export async function enrichIssuer(payload) {
   const response = await fetch("/api/issuer/enrichment", {
     method: "POST",

@@ -5,6 +5,7 @@ import {
   fetchBondDetails,
   fetchBondVolumes,
   fetchBonds,
+  fetchIctaxSecurity,
   fetchIssuerEnrichment,
   fetchIssuerEnrichmentBatch,
   fetchIssuerEnrichmentJob,
@@ -123,12 +124,19 @@ function buildIssuerContext(detail, selected) {
   const currency = details.issueCurrency || selected?.Currency || "";
   const maturity =
     details.maturity || overview.maturityDate || selected?.MaturityDate || "";
+  const industry =
+    selected?.IndustrySectorDesc || selected?.IndustrySectorCode || "";
+  const productLine = selected?.ProductLine || "";
+  const secType = selected?.SecTypeCode || "";
   return [
     `Issuer: ${issuer}`,
     country ? `Issuer country: ${country}` : null,
     currency ? `Issue currency: ${currency}` : null,
     maturity ? `Maturity: ${maturity}` : null,
-    selected?.ShortName ? `Bond: ${selected.ShortName}` : null
+    selected?.ShortName ? `Bond: ${selected.ShortName}` : null,
+    industry ? `Industry sector: ${industry}` : null,
+    productLine ? `Product line: ${productLine}` : null,
+    secType ? `Security type: ${secType}` : null
   ]
     .filter(Boolean)
     .join("\n");
@@ -378,10 +386,10 @@ function formatImpliedGovSpreadTooltip({ yieldToWorst, govYield, source }) {
   }
   return [
     `YieldToWorst (SIX): ${formatPercent(yieldToWorst, 2)}`,
-    `Gov curve yield (implied): ${formatPercent(govYield, 2)}`,
-    "Gov curve yield is estimated from the fitted Swiss Confederation curve, not an official quote.",
-    `Curve fit: ${source || "implied gov curve"}`,
-    "Spread (bps) = (YieldToWorst - implied gov curve) * 100."
+    `Gov curve yield (Swissies): ${formatPercent(govYield, 2)}`,
+    "Gov curve yield is derived from Swiss Confederation bonds (SIX), not an official SNB quote.",
+    `Curve fit: ${source || "Swiss Confederation fit"}`,
+    "Spread (bps) = (YieldToWorst - gov curve) * 100."
   ].join("\n");
 }
 
@@ -417,6 +425,44 @@ function formatVolumeShort(value) {
     return `${formatNumber(value / 1000, 0)}k`;
   }
   return formatNumber(value, 0);
+}
+
+function useCachedChart(data, enabled) {
+  const [cached, setCached] = useState(data);
+
+  useEffect(() => {
+    if (data?.points?.length) {
+      setCached(data);
+    }
+  }, [data]);
+
+  if (!enabled) return data;
+  if (data?.points?.length) return data;
+  if (cached?.points?.length) return cached;
+  return data;
+}
+
+function useDebouncedValue(value, delayMs) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const handle = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(handle);
+  }, [value, delayMs]);
+
+  return debounced;
+}
+
+function useStableRange(range, freeze) {
+  const ref = useRef(range);
+
+  useEffect(() => {
+    if (!freeze) {
+      ref.current = range;
+    }
+  }, [range, freeze]);
+
+  return freeze ? ref.current : range;
 }
 
 function SourcePopover({ sources }) {
@@ -723,6 +769,9 @@ function buildActualScenarioForSchedule({
     grossIrr,
     feeIrr,
     taxIrr,
+    cashflowsGross,
+    cashflowsFee,
+    cashflowsTax,
     breakEvenFees,
     breakEvenFeesTax
   };
@@ -847,7 +896,7 @@ function computeActualGrossIrrForBond({ bond, detail }) {
   return { grossIrr: chosenScenario.grossIrr, askYield };
 }
 
-function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
+function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees, notional = 100 }) {
   if (!bond || !detail) return null;
   const market = detail?.market || {};
   const askYield = parseNumber(bond.YieldToWorst);
@@ -901,18 +950,20 @@ function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
     frequency
   });
 
-  const accrued = computeAccruedInterest({
+  const accruedPer100 = computeAccruedInterest({
     couponRate,
     notional: 100,
     accrualStart,
     settlementDate
   });
-  const dirtyPrice = Number.isFinite(accrued) ? cleanPrice + accrued : cleanPrice;
+  const dirtyPrice = Number.isFinite(accruedPer100)
+    ? cleanPrice + accruedPer100
+    : cleanPrice;
 
   const maturitySchedule = buildCashflowScheduleFromRedemption({
     redemptionDate: maturityDate,
     frequency,
-    notional: 100,
+    notional,
     couponRate,
     settlementDate
   });
@@ -920,7 +971,7 @@ function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
     pricePer100: dirtyPrice,
     schedule: maturitySchedule,
     settlementDate,
-    notional: 100,
+    notional,
     couponRate,
     taxRate: taxRate || 0,
     fees: fees || ZERO_FEES
@@ -932,7 +983,7 @@ function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
     const callSchedule = buildCashflowScheduleFromRedemption({
       redemptionDate: callDate,
       frequency,
-      notional: 100,
+      notional,
       couponRate,
       settlementDate
     });
@@ -940,7 +991,7 @@ function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
       pricePer100: dirtyPrice,
       schedule: callSchedule,
       settlementDate,
-      notional: 100,
+      notional,
       couponRate,
       taxRate: taxRate || 0,
       fees: fees || ZERO_FEES
@@ -958,10 +1009,13 @@ function computeDirtyYtwScenarioForBond({ bond, detail, taxRate, fees }) {
 
   return {
     scenario: chosenScenario,
+    cashflowsGross: chosenScenario.cashflowsGross,
+    cashflowsFee: chosenScenario.cashflowsFee,
+    cashflowsTax: chosenScenario.cashflowsTax,
     askYield,
     cleanPrice,
     dirtyPrice,
-    accrued,
+    accrued: accruedPer100,
     settlementDate,
     callDate,
     maturityDate
@@ -1379,7 +1433,7 @@ function XYScatterPlot({ data, onPointClick, xLabel, yLabel }) {
   const width = 800;
   const height = 320;
   const padding = { left: 60, right: 20, top: 20, bottom: 50 };
-  const { points, xMin, xMax, yMin, yMax } = data;
+  const { points, xMin, xMax, yMin, yMax, regression } = data;
 
   const xScale = (value) =>
     padding.left +
@@ -1504,6 +1558,15 @@ function XYScatterPlot({ data, onPointClick, xLabel, yLabel }) {
           </title>
         </circle>
       ))}
+      {regression ? (
+        <line
+          x1={xScale(xMin)}
+          y1={yScale(regression.slope * xMin + regression.intercept)}
+          x2={xScale(xMax)}
+          y2={yScale(regression.slope * xMax + regression.intercept)}
+          className="trend-line"
+        />
+      ) : null}
       {hovered && tooltip ? (
         <g className="tooltip" pointerEvents="none">
           <rect
@@ -1993,19 +2056,29 @@ function CurveChart({ points, govPoints, govFits, onPointClick }) {
 
 export default function App() {
   const [view, setView] = useState("search");
+  const [authReady, setAuthReady] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authOk, setAuthOk] = useState(false);
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
   const [filters, setFilters] = useState({
     maturityBucket: "2-3",
     currency: "CHF",
     country: "CH",
-    industrySector: ""
+    industrySector: "",
+    afterTaxMin: "",
+    govSpreadMax: "",
+    veganFilter: ""
   });
   const [sortState, setSortState] = useState({ key: "MaturityDate", dir: "asc" });
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(200);
+  const [pageSizeTouched, setPageSizeTouched] = useState(false);
   const [bonds, setBonds] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showChart, setShowChart] = useState(false);
+  const [chartMode, setChartMode] = useState("maturity-ask");
   const [curve, setCurve] = useState(null);
   const [curveLoading, setCurveLoading] = useState(false);
   const [curveError, setCurveError] = useState("");
@@ -2017,6 +2090,8 @@ export default function App() {
   const [volumeError, setVolumeError] = useState("");
   const [portfolioPricingBasis, setPortfolioPricingBasis] = useState("last");
   const [portfolioScheduleView, setPortfolioScheduleView] = useState("aggregate");
+  const [assumptionsOpen, setAssumptionsOpen] = useState(false);
+  const [activePreset, setActivePreset] = useState(null);
 
   const issuerNames = useMemo(() => {
     const names = new Set();
@@ -2028,6 +2103,7 @@ export default function App() {
     return Array.from(names);
   }, [bonds]);
   const issuerNamesKey = issuerNames.join("|");
+
 
   const sectorOptions = useMemo(() => {
     const values = new Set();
@@ -2053,13 +2129,75 @@ export default function App() {
     state: "idle",
     message: ""
   });
+  const [issuerEnrichmentDebug, setIssuerEnrichmentDebug] = useState(null);
   const [issuerTableEnrichment, setIssuerTableEnrichment] = useState({});
   const issuerEnrichmentRequestId = useRef(0);
   const [ratingPopover, setRatingPopover] = useState(null);
   const ratingContainerRef = useRef(null);
+  const detailPanelRef = useRef(null);
   const [grossIrrChartDetails, setGrossIrrChartDetails] = useState({});
   const [grossIrrChartLoading, setGrossIrrChartLoading] = useState(false);
   const [grossIrrChartError, setGrossIrrChartError] = useState("");
+  const [cachedAfterTaxMap, setCachedAfterTaxMap] = useState({});
+  const [iupMap, setIupMap] = useState({});
+  const [iupStatus, setIupStatus] = useState({ state: "idle", message: "" });
+  const debouncedAfterTaxMin = useDebouncedValue(filters.afterTaxMin, 200);
+  const debouncedGovSpreadMax = useDebouncedValue(filters.govSpreadMax, 200);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("bondsscanner_after_tax_cache");
+      if (!stored) return;
+      const parsed = JSON.parse(stored);
+      if (parsed && typeof parsed === "object") {
+        setCachedAfterTaxMap(parsed);
+      }
+    } catch (err) {
+      // Ignore corrupted cache.
+    }
+  }, []);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const response = await fetch("/api/auth/status");
+        if (!response.ok) throw new Error("Auth status failed");
+        const data = await response.json();
+        if (!data?.requires_auth) {
+          setAuthOk(true);
+          setAuthRequired(false);
+          return;
+        }
+        const stored = localStorage.getItem("bondsscanner_auth_ok");
+        setAuthOk(stored === "1");
+        setAuthRequired(true);
+      } catch (err) {
+        setAuthRequired(true);
+      } finally {
+        setAuthReady(true);
+      }
+    };
+    checkAuth();
+  }, []);
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setAuthError("");
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: authPassword })
+      });
+      if (!response.ok) {
+        throw new Error("Invalid password");
+      }
+      localStorage.setItem("bondsscanner_auth_ok", "1");
+      setAuthOk(true);
+    } catch (err) {
+      setAuthError("Wrong password. Please try again.");
+    }
+  };
 
   const [notional, setNotional] = useState(100000);
   const [notionalInput, setNotionalInput] = useState("100000");
@@ -2203,6 +2341,50 @@ export default function App() {
     return map;
   }, [bonds, taxRate, grossIrrChartDetails]);
 
+  useEffect(() => {
+    if (!afterTaxYieldMap || Object.keys(afterTaxYieldMap).length === 0) return;
+    setCachedAfterTaxMap((prev) => {
+      const now = Date.now();
+      const cutoff = now - 7 * 24 * 60 * 60 * 1000;
+      const next = { ...prev };
+      Object.entries(afterTaxYieldMap).forEach(([id, entry]) => {
+        if (!entry || !Number.isFinite(entry.yield)) return;
+        next[id] = {
+          yield: entry.yield,
+          tooltip: entry.tooltip,
+          ts: now
+        };
+      });
+      Object.keys(next).forEach((id) => {
+        if (!next[id]?.ts || next[id].ts < cutoff) {
+          delete next[id];
+        }
+      });
+      try {
+        localStorage.setItem("bondsscanner_after_tax_cache", JSON.stringify(next));
+      } catch (err) {
+        // Ignore storage quota errors.
+      }
+      return next;
+    });
+  }, [afterTaxYieldMap]);
+
+  const afterTaxYieldEntries = useMemo(() => {
+    const entries = {};
+    bonds.forEach((bond) => {
+      const live = afterTaxYieldMap[bond.ValorId];
+      if (live && Number.isFinite(live.yield)) {
+        entries[bond.ValorId] = { ...live, cached: false };
+        return;
+      }
+      const cached = cachedAfterTaxMap[bond.ValorId];
+      if (cached && Number.isFinite(cached.yield)) {
+        entries[bond.ValorId] = { ...cached, cached: true };
+      }
+    });
+    return entries;
+  }, [bonds, afterTaxYieldMap, cachedAfterTaxMap]);
+
   const impliedGovSpreadMap = useMemo(() => {
     const map = {};
     const fitPoints = govCurve?.fits?.spline?.length
@@ -2224,6 +2406,50 @@ export default function App() {
     });
     return map;
   }, [bonds, govCurve]);
+
+  const valueFilterRanges = useMemo(() => {
+    const afterTaxValues = bonds
+      .map((bond) => parseNumber(afterTaxYieldEntries[bond.ValorId]?.yield))
+      .filter((value) => Number.isFinite(value));
+    const govSpreadValues = bonds
+      .map((bond) => {
+        const spread = parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread);
+        return Number.isFinite(spread) ? spread / 100 : null;
+      })
+      .filter((value) => Number.isFinite(value));
+    let afterTaxMin = afterTaxValues.length ? Math.min(...afterTaxValues) : 0;
+    let afterTaxMax = afterTaxValues.length ? Math.max(...afterTaxValues) : 5;
+    let govSpreadMin = govSpreadValues.length ? Math.min(...govSpreadValues) : 0;
+    let govSpreadMax = govSpreadValues.length ? Math.max(...govSpreadValues) : 5;
+    if (afterTaxMin === afterTaxMax) {
+      afterTaxMin = afterTaxMin - 0.5;
+      afterTaxMax = afterTaxMax + 0.5;
+    }
+    if (govSpreadMin === govSpreadMax) {
+      govSpreadMin = Math.max(0, govSpreadMin - 0.5);
+      govSpreadMax = govSpreadMax + 0.5;
+    }
+    return {
+      afterTaxMin,
+      afterTaxMax,
+      govSpreadMin,
+      govSpreadMax
+    };
+  }, [bonds, afterTaxYieldEntries, impliedGovSpreadMap]);
+
+  const stableValueFilterRanges = useStableRange(
+    valueFilterRanges,
+    loading || grossIrrChartLoading
+  );
+
+  const afterTaxSliderValue = Number.isFinite(parseNumber(filters.afterTaxMin))
+    ? parseNumber(filters.afterTaxMin)
+    : stableValueFilterRanges.afterTaxMin;
+  const govSpreadSliderValue = Number.isFinite(parseNumber(filters.govSpreadMax))
+    ? parseNumber(filters.govSpreadMax)
+    : stableValueFilterRanges.govSpreadMax;
+  const afterTaxActive = Number.isFinite(parseNumber(filters.afterTaxMin));
+  const govSpreadActive = Number.isFinite(parseNumber(filters.govSpreadMax));
 
   useEffect(() => {
     if (bonds.length === 0) return;
@@ -2277,11 +2503,25 @@ export default function App() {
         const response = await fetchIssuerEnrichmentBatch(issuerNames);
         if (!active) return;
         const items = response.items || {};
+        const normalizedItems = Object.entries(items).reduce((acc, [key, value]) => {
+          const normalized = normalizeIssuerKey(key);
+          if (normalized && value) acc[normalized] = value;
+          return acc;
+        }, {});
         setIssuerTableEnrichment((prev) => {
           const next = { ...prev };
+          Object.entries(items).forEach(([key, enrichment]) => {
+            if (!enrichment) return;
+            next[key] = { status: "ready", enrichment };
+            const normalized = normalizeIssuerKey(key);
+            if (normalized) {
+              next[normalized] = { status: "ready", enrichment };
+            }
+          });
           issuerNames.forEach((issuer) => {
             const existing = prev[issuer];
-            const enrichment = items[issuer];
+            const enrichment =
+              items[issuer] || normalizedItems[normalizeIssuerKey(issuer)];
             if (enrichment) {
               next[issuer] = { status: "ready", enrichment };
               return;
@@ -2290,6 +2530,15 @@ export default function App() {
               next[issuer] = { status: "missing", enrichment: null };
             }
           });
+          if (window?.location?.search?.includes("debugRatings=1")) {
+            const missing = issuerNames.filter(
+              (issuer) =>
+                !items[issuer] && !normalizedItems[normalizeIssuerKey(issuer)]
+            );
+            if (missing.length) {
+              console.debug("[issuer-ratings] missing after batch", missing.slice(0, 10));
+            }
+          }
           return next;
         });
       } catch (err) {
@@ -2324,16 +2573,21 @@ export default function App() {
       const sectorCode = filters.industrySector
         ? String(filters.industrySector).split("-")[0].trim()
         : "";
+      const requestPageSize = pageSizeTouched ? pageSize : 200;
       const response = await fetchBonds({
         maturityBucket: filters.maturityBucket,
         currency: filters.currency,
         country: filters.country,
         industrySector: sectorCode,
         page: 1,
-        pageSize
+        pageSize: requestPageSize
       });
       setBonds(response.items || []);
-      setTotal(response.total || 0);
+      const totalCount = response.total || 0;
+      setTotal(totalCount);
+      if (!pageSizeTouched && totalCount > 0) {
+        setPageSize(Math.min(totalCount, 200));
+      }
     } catch (err) {
       setError(err.message || "Failed to load bonds.");
     } finally {
@@ -2350,9 +2604,60 @@ export default function App() {
     });
   };
 
+  const resetSearchFilters = () => {
+    setFilters({
+      maturityBucket: "2-3",
+      currency: "CHF",
+      country: "CH",
+      industrySector: "",
+      afterTaxMin: "",
+      govSpreadMax: "",
+      veganFilter: ""
+    });
+    setPageSizeTouched(false);
+    setPageSize(200);
+  };
+
+  const applyPreset = (preset, meta) => {
+    setFilters((prev) => ({
+      ...prev,
+      afterTaxMin: "",
+      govSpreadMax: "",
+      ...preset
+    }));
+    setPageSizeTouched(false);
+    setPageSize(200);
+    if (meta) {
+      setActivePreset(meta);
+    }
+  };
+
+  const normalizeIssuerKey = (name) => {
+    return String(name || "")
+      .toLowerCase()
+      .replace(/[.,/#!$%^&*;:{}=_`~()]/g, "")
+      .replace(/\b(ag|sa|plc|ltd|limited|inc|corp|corporation|group|holding|holdings|co|company)\b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  const issuerEnrichmentIndex = useMemo(() => {
+    const index = {};
+    Object.entries(issuerTableEnrichment).forEach(([key, value]) => {
+      const normalized = normalizeIssuerKey(key);
+      if (!normalized) return;
+      if (!index[normalized]) {
+        index[normalized] = value;
+      }
+    });
+    return index;
+  }, [issuerTableEnrichment]);
+
   const getIssuerRatingInfo = (issuerName) => {
     if (!issuerName) return { status: "missing", values: [], rank: null };
-    const entry = issuerTableEnrichment[issuerName];
+    const entry =
+      issuerTableEnrichment[issuerName] ||
+      issuerEnrichmentIndex[normalizeIssuerKey(issuerName)];
     const status = entry?.status;
     if (!entry || status === "missing" || status === "idle") {
       return { status: "missing", values: [], rank: null };
@@ -2381,6 +2686,50 @@ export default function App() {
       values,
       rank: rankCandidates.length ? Math.min(...rankCandidates) : null
     };
+  };
+
+  const resolveVeganStatus = (issuerName) => {
+    if (!issuerName) return "unknown";
+    const entry =
+      issuerTableEnrichment[issuerName] ||
+      issuerEnrichmentIndex[normalizeIssuerKey(issuerName)];
+    if (!entry || entry.status !== "ready") return "unknown";
+    const value = entry?.enrichment?.vegan_friendly;
+    if (value === true || value === 1) return "yes";
+    if (value === false || value === 0) return "no";
+    return "unknown";
+  };
+
+  const resolveAfterTaxValue = (bond) => {
+    return parseNumber(afterTaxYieldEntries[bond.ValorId]?.yield);
+  };
+
+  const resolveGovSpreadPct = (bond) => {
+    const spreadBps = parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread);
+    if (!Number.isFinite(spreadBps)) return null;
+    return spreadBps / 100;
+  };
+
+  const resolveAfterTaxGovValue = (bond) => {
+    const afterTax = resolveAfterTaxValue(bond);
+    const govSpreadPct = resolveGovSpreadPct(bond);
+    if (!Number.isFinite(afterTax) || !Number.isFinite(govSpreadPct)) return null;
+    return afterTax - govSpreadPct;
+  };
+
+  const resolveIupFlag = (bond) => {
+    const isin = bond?.ISIN;
+    if (!isin) return null;
+    const maturity = String(bond?.MaturityDate || "").replace(/\D/g, "");
+    const key = `${isin}:${maturity}`;
+    const entry = iupMap[key];
+    if (!entry) return null;
+    return entry.iup;
+  };
+
+  const parseOptionalNumber = (value) => {
+    if (value === "" || value === null || value === undefined) return null;
+    return parseNumber(value);
   };
 
   const sortedBonds = useMemo(() => {
@@ -2420,18 +2769,44 @@ export default function App() {
             return Number.isFinite(fallback) ? fallback : totalVolume;
           }
         case "AfterTaxYield":
-          return parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+          return resolveAfterTaxValue(bond);
+        case "AfterTaxGovValue":
+          return resolveAfterTaxGovValue(bond);
         case "IssuerRating": {
           const issuerName = bond.IssuerNameFull || "";
           const ratingInfo = getIssuerRatingInfo(issuerName);
           return ratingInfo.rank;
+        }
+        case "VeganFriendly": {
+          const status = resolveVeganStatus(bond.IssuerNameFull || "");
+          if (status === "yes") return 2;
+          if (status === "no") return 1;
+          return 0;
         }
         default:
           return bond[sortState.key];
       }
     };
 
-    return [...bonds].sort((a, b) => {
+    const minAfterTax = parseOptionalNumber(debouncedAfterTaxMin);
+    const maxGovSpread = parseOptionalNumber(debouncedGovSpreadMax);
+    const filtered = bonds.filter((bond) => {
+      if (Number.isFinite(minAfterTax)) {
+        const afterTax = resolveAfterTaxValue(bond);
+        if (!Number.isFinite(afterTax) || afterTax < minAfterTax) return false;
+      }
+      if (Number.isFinite(maxGovSpread)) {
+        const govSpreadPct = resolveGovSpreadPct(bond);
+        if (!Number.isFinite(govSpreadPct) || govSpreadPct > maxGovSpread) return false;
+      }
+      if (filters.veganFilter) {
+        const status = resolveVeganStatus(bond.IssuerNameFull || "");
+        if (filters.veganFilter !== status) return false;
+      }
+      return true;
+    });
+
+    return [...filtered].sort((a, b) => {
       const valueA = getValue(a);
       const valueB = getValue(b);
       const aNull = valueA === null || valueA === undefined || valueA === "";
@@ -2453,9 +2828,12 @@ export default function App() {
     bonds,
     sortState,
     volumes,
-    afterTaxYieldMap,
+    afterTaxYieldEntries,
     issuerTableEnrichment,
-    impliedGovSpreadMap
+    impliedGovSpreadMap,
+    debouncedAfterTaxMin,
+    debouncedGovSpreadMax,
+    filters.veganFilter
   ]);
 
   const sortIndicator = (key) => {
@@ -2463,15 +2841,31 @@ export default function App() {
     return sortState.dir === "asc" ? " ^" : " v";
   };
 
+  const sortLabelMap = {
+    IssuerNameFull: "Issuer",
+    IssuerRating: "Ratings",
+    ShortName: "Bond",
+    IndustrySectorDesc: "Sector",
+    MaturityDate: "Maturity",
+    CouponRate: "Coupon",
+    AfterTaxYield: "IRR (after-tax)",
+    AfterTaxGovValue: "After-tax − Gov",
+    DayVolume: "Day volume",
+    ImpliedGovSpreadBps: "Gov spread (YTW)",
+    VeganFriendly: "Vegan"
+  };
+
   const openDetails = async (bond) => {
     issuerEnrichmentRequestId.current += 1;
     setIssuerEnrichment(null);
     setIssuerEnrichmentStatus({ state: "idle", message: "" });
+    setIssuerEnrichmentDebug(null);
     setRatingPopover(null);
     setSelected(bond);
     setDetail(null);
     setDetailError("");
     setDetailLoading(true);
+    setIupStatus({ state: "loading", message: "" });
     try {
       const data = await fetchBondDetails(bond.ValorId);
       setDetail(data);
@@ -2482,19 +2876,106 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!selected) return;
+    const isin = selected?.ISIN;
+    const maturityRaw = selected?.MaturityDate || "";
+    const maturity = String(maturityRaw).replace(/\D/g, "");
+    if (!isin) {
+      setIupStatus({ state: "missing", message: "ISIN unavailable." });
+      return;
+    }
+    const key = `${isin}:${maturity}`;
+    if (iupMap[key]) {
+      setIupStatus({ state: "ready", message: "" });
+      return;
+    }
+    let active = true;
+    setIupStatus({ state: "loading", message: "" });
+    fetchIctaxSecurity({ isin, maturity })
+      .then((data) => {
+        if (!active) return;
+        setIupMap((prev) => ({ ...prev, [key]: data }));
+        setIupStatus({ state: "ready", message: "" });
+      })
+      .catch(() => {
+        if (!active) return;
+        setIupStatus({
+          state: "error",
+          message: "ICTax lookup failed."
+        });
+      });
+    return () => {
+      active = false;
+    };
+  }, [selected, iupMap]);
+
+  useEffect(() => {
+    if (!selected) return;
+    const node = detailPanelRef.current;
+    if (node && typeof node.scrollIntoView === "function") {
+      node.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [selected]);
+
+  useEffect(() => {
+    if (!selected) return;
+    const issuerName = detail?.overview?.issuerName || selected?.IssuerNameFull || "";
+    if (!issuerName) return;
+    const entry =
+      issuerTableEnrichment[issuerName] ||
+      issuerEnrichmentIndex[normalizeIssuerKey(issuerName)];
+    if (!entry) return;
+    if (entry.status === "loading") {
+      setIssuerEnrichmentStatus({
+        state: "loading",
+        message: "Fetching issuer ratings..."
+      });
+      return;
+    }
+    if (entry.status === "queued") {
+      setIssuerEnrichmentStatus({
+        state: "queued",
+        message: "Queued for ratings refresh..."
+      });
+      if (entry.jobId) {
+        pollIssuerTableEnrichment(entry.jobId, issuerName);
+      }
+      return;
+    }
+    if (entry.status === "ready" && entry.enrichment) {
+      setIssuerEnrichment(entry.enrichment);
+      setIssuerEnrichmentStatus({ state: "done", message: "" });
+    }
+  }, [selected, detail, issuerTableEnrichment, issuerEnrichmentIndex]);
+
   const pollIssuerEnrichment = async (jobId, issuerName, requestId, attempt = 0) => {
     if (issuerEnrichmentRequestId.current !== requestId) return;
     try {
       const job = await fetchIssuerEnrichmentJob(jobId);
       if (issuerEnrichmentRequestId.current !== requestId) return;
       if (job?.status === "done") {
+        if (job?.result_json) {
+          try {
+            setIssuerEnrichmentDebug(JSON.parse(job.result_json));
+          } catch {
+            setIssuerEnrichmentDebug({ raw: job.result_json });
+          }
+        }
         const enrichment = await fetchIssuerEnrichment(issuerName);
         if (issuerEnrichmentRequestId.current !== requestId) return;
         setIssuerEnrichment(enrichment);
-        setIssuerTableEnrichment((prev) => ({
-          ...prev,
-          [issuerName]: { status: "ready", enrichment }
-        }));
+        const keys = new Set([issuerName]);
+        if (selected?.IssuerNameFull) keys.add(selected.IssuerNameFull);
+        keys.add(normalizeIssuerKey(issuerName));
+        setIssuerTableEnrichment((prev) => {
+          const next = { ...prev };
+          keys.forEach((key) => {
+            if (!key) return;
+            next[key] = { status: "ready", enrichment };
+          });
+          return next;
+        });
         setIssuerEnrichmentStatus({ state: "done", message: "" });
         return;
       }
@@ -2536,7 +3017,7 @@ export default function App() {
         const enrichment = await fetchIssuerEnrichment(issuerName);
         setIssuerTableEnrichment((prev) => ({
           ...prev,
-          [issuerName]: { status: "ready", enrichment }
+          [issuerName]: { status: "ready", enrichment, jobId: null }
         }));
         return;
       }
@@ -2545,7 +3026,8 @@ export default function App() {
           ...prev,
           [issuerName]: {
             status: "error",
-            enrichment: prev[issuerName]?.enrichment || null
+            enrichment: prev[issuerName]?.enrichment || null,
+            jobId: null
           }
         }));
         return;
@@ -2555,7 +3037,8 @@ export default function App() {
           ...prev,
           [issuerName]: {
             status: "queued",
-            enrichment: prev[issuerName]?.enrichment || null
+            enrichment: prev[issuerName]?.enrichment || null,
+            jobId
           }
         }));
         return;
@@ -2569,7 +3052,8 @@ export default function App() {
           ...prev,
           [issuerName]: {
             status: "queued",
-            enrichment: prev[issuerName]?.enrichment || null
+            enrichment: prev[issuerName]?.enrichment || null,
+            jobId
           }
         }));
         return;
@@ -2582,10 +3066,24 @@ export default function App() {
 
   const handleFetchIssuerRatings = async (issuerName) => {
     if (!issuerName) return;
+    const selectedIssuer =
+      detail?.overview?.issuerName || selected?.IssuerNameFull || "";
+    const isSelected =
+      normalizeIssuerKey(selectedIssuer) === normalizeIssuerKey(issuerName);
     setIssuerTableEnrichment((prev) => ({
       ...prev,
-      [issuerName]: { status: "loading", enrichment: prev[issuerName]?.enrichment || null }
+      [issuerName]: {
+        status: "loading",
+        enrichment: prev[issuerName]?.enrichment || null,
+        jobId: null
+      }
     }));
+    if (isSelected) {
+      setIssuerEnrichmentStatus({
+        state: "loading",
+        message: "Fetching issuer ratings..."
+      });
+    }
     try {
       const response = await enrichIssuer({
         issuer_name: issuerName,
@@ -2597,27 +3095,61 @@ export default function App() {
       if (response?.status === "cached" && response.enrichment) {
         setIssuerTableEnrichment((prev) => ({
           ...prev,
-          [issuerName]: { status: "ready", enrichment: response.enrichment }
+          [issuerName]: { status: "ready", enrichment: response.enrichment, jobId: null }
         }));
+        if (isSelected) {
+          setIssuerEnrichment(response.enrichment);
+          setIssuerEnrichmentStatus({ state: "done", message: "" });
+        }
         return;
       }
       if (response?.status === "queued" && response.job_id) {
         setIssuerTableEnrichment((prev) => ({
           ...prev,
-          [issuerName]: { status: "queued", enrichment: prev[issuerName]?.enrichment || null }
+          [issuerName]: {
+            status: "queued",
+            enrichment: prev[issuerName]?.enrichment || null,
+            jobId: response.job_id
+          }
         }));
+        if (isSelected) {
+          setIssuerEnrichmentStatus({
+            state: "queued",
+            message: "Queued for ratings refresh..."
+          });
+        }
         pollIssuerTableEnrichment(response.job_id, issuerName);
         return;
       }
       setIssuerTableEnrichment((prev) => ({
         ...prev,
-        [issuerName]: { status: "error", enrichment: prev[issuerName]?.enrichment || null }
+        [issuerName]: {
+          status: "error",
+          enrichment: prev[issuerName]?.enrichment || null,
+          jobId: null
+        }
       }));
+      if (isSelected) {
+        setIssuerEnrichmentStatus({
+          state: "failed",
+          message: "Issuer ratings refresh failed."
+        });
+      }
     } catch (err) {
       setIssuerTableEnrichment((prev) => ({
         ...prev,
-        [issuerName]: { status: "error", enrichment: prev[issuerName]?.enrichment || null }
+        [issuerName]: {
+          status: "error",
+          enrichment: prev[issuerName]?.enrichment || null,
+          jobId: null
+        }
       }));
+      if (isSelected) {
+        setIssuerEnrichmentStatus({
+          state: "failed",
+          message: "Issuer ratings refresh failed."
+        });
+      }
     }
   };
 
@@ -2625,14 +3157,20 @@ export default function App() {
     const issuerName = detail?.overview?.issuerName || selected?.IssuerNameFull || "";
     const context = buildIssuerContext(detail, selected);
     const profilePrompt = [
-      "You are enriching a bond issuer profile.",
+      "You are classifying whether a company is vegan friendly.",
       "Return JSON with keys: summary_md, vegan_friendly, vegan_explanation, esg_summary.",
       "Summary must be exactly one sentence.",
-      "vegan_friendly must be true/false, with a brief explanation in vegan_explanation.",
-      "Set vegan_friendly=false ONLY if there is clear evidence the issuer sells animal-derived products OR performs/commissions animal testing.",
-      "Otherwise set vegan_friendly=true (including industries like construction, software, finance).",
-      "If the context is insufficient, return null and state the uncertainty in vegan_explanation.",
-      "Only use the provided context; do not browse or guess.",
+      "Rules:",
+      "- vegan_friendly = false if the company:",
+      "  * produces/sells animal-derived food products (meat, dairy, eggs, leather),",
+      "  * runs animal agriculture or slaughter/processing,",
+      "  * performs or commissions animal testing (including pharmaceuticals/biotech).",
+      "- vegan_friendly = true only if there is clear evidence the company does NOT do any of the above.",
+      "- For banks, software, construction, and other non-animal industries: default to true unless context indicates involvement in animal testing or animal-derived products.",
+      "- For pharma/biotech: default to false unless explicit evidence of no animal testing exists.",
+      "- If the context is insufficient, set vegan_friendly = null and say what's missing.",
+      "- If you are unsure, you MAY browse to verify; only browse when needed.",
+      "Use provided context first; browse only if needed.",
       "",
       `Issuer: ${issuerName || "Unknown issuer"}`,
       "Context:",
@@ -2662,16 +3200,22 @@ export default function App() {
   const handleCopyPrompt = async () => {
     const text = buildIssuerPromptPreview();
     try {
-      await navigator.clipboard.writeText(text);
-      setIssuerEnrichmentStatus({
-        state: "done",
-        message: "Prompt copied to clipboard."
-      });
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      setIssuerEnrichmentStatus({ state: "done", message: "Prompt copied." });
     } catch (err) {
-      setIssuerEnrichmentStatus({
-        state: "failed",
-        message: err.message || "Failed to copy prompt."
-      });
+      setIssuerEnrichmentStatus({ state: "failed", message: "Failed to copy prompt." });
     }
   };
 
@@ -2689,6 +3233,7 @@ export default function App() {
     const requestId = issuerEnrichmentRequestId.current + 1;
     issuerEnrichmentRequestId.current = requestId;
     setIssuerEnrichment(null);
+    setIssuerEnrichmentDebug(null);
     setIssuerEnrichmentStatus({ state: "loading", message: "Enriching issuer..." });
 
     try {
@@ -2702,10 +3247,17 @@ export default function App() {
       });
       if (response?.status === "cached" && response.enrichment) {
         setIssuerEnrichment(response.enrichment);
-        setIssuerTableEnrichment((prev) => ({
-          ...prev,
-          [issuerName]: { status: "ready", enrichment: response.enrichment }
-        }));
+        const keys = new Set([issuerName]);
+        if (selected?.IssuerNameFull) keys.add(selected.IssuerNameFull);
+        keys.add(normalizeIssuerKey(issuerName));
+        setIssuerTableEnrichment((prev) => {
+          const next = { ...prev };
+          keys.forEach((key) => {
+            if (!key) return;
+            next[key] = { status: "ready", enrichment: response.enrichment };
+          });
+          return next;
+        });
         setIssuerEnrichmentStatus({ state: "done", message: "" });
         return;
       }
@@ -2865,12 +3417,14 @@ export default function App() {
     return { points, xMin, xMax, yMin, yMax };
   }, [bonds]);
 
+  const chartDataDisplay = useCachedChart(chartData, loading);
+
   const afterTaxChartData = useMemo(() => {
     const points = bonds
       .map((bond) => {
         const years = maturityYearsFromValue(bond.MaturityDate);
         if (!Number.isFinite(years)) return null;
-        const afterTax = parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+        const afterTax = parseNumber(afterTaxYieldEntries[bond.ValorId]?.yield);
         if (!Number.isFinite(afterTax)) return null;
         return { years, askYield: afterTax, bond };
       })
@@ -2894,7 +3448,56 @@ export default function App() {
     }
 
     return { points, xMin, xMax, yMin, yMax };
-  }, [bonds, afterTaxYieldMap]);
+  }, [bonds, afterTaxYieldEntries]);
+
+  const afterTaxChartDataDisplay = useCachedChart(afterTaxChartData, loading);
+
+  const afterTaxGovSpreadChart = useMemo(() => {
+    const points = bonds
+      .map((bond) => {
+        const afterTax = parseNumber(afterTaxYieldEntries[bond.ValorId]?.yield);
+        const spreadBps = parseNumber(impliedGovSpreadMap[bond.ValorId]?.spread);
+        if (!Number.isFinite(afterTax) || !Number.isFinite(spreadBps)) return null;
+        return { x: spreadBps / 100, y: afterTax, bond };
+      })
+      .filter(Boolean);
+
+    if (points.length === 0) {
+      return { points: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1, regression: null };
+    }
+
+    const xValues = points.map((p) => p.x);
+    const yValues = points.map((p) => p.y);
+    let xMin = Math.min(...xValues);
+    let xMax = Math.max(...xValues);
+    let yMin = Math.min(...yValues);
+    let yMax = Math.max(...yValues);
+    if (xMin === xMax) {
+      xMin = xMin - 1;
+      xMax = xMax + 1;
+    }
+    if (yMin === yMax) {
+      yMin = yMin - 1;
+      yMax = yMax + 1;
+    }
+
+    const xMean = xValues.reduce((sum, value) => sum + value, 0) / xValues.length;
+    const yMean = yValues.reduce((sum, value) => sum + value, 0) / yValues.length;
+    let numerator = 0;
+    let denominator = 0;
+    points.forEach((point) => {
+      const dx = point.x - xMean;
+      numerator += dx * (point.y - yMean);
+      denominator += dx * dx;
+    });
+    const slope = denominator ? numerator / denominator : null;
+    const intercept = slope === null ? null : yMean - slope * xMean;
+    const regression = slope === null ? null : { slope, intercept };
+
+    return { points, xMin, xMax, yMin, yMax, regression };
+  }, [bonds, afterTaxYieldEntries, impliedGovSpreadMap]);
+
+  const afterTaxGovSpreadChartDisplay = useCachedChart(afterTaxGovSpreadChart, loading);
 
   const ratingChartData = useMemo(() => {
     const points = bonds
@@ -2908,7 +3511,7 @@ export default function App() {
         if (!rating) return null;
         const ratingRank = spFitchRatingRank(rating);
         if (!Number.isFinite(ratingRank)) return null;
-        const afterTax = parseNumber(afterTaxYieldMap[bond.ValorId]?.yield);
+        const afterTax = parseNumber(afterTaxYieldEntries[bond.ValorId]?.yield);
         if (!Number.isFinite(afterTax)) return null;
         return { rating, ratingRank, afterTax, bond };
       })
@@ -2942,7 +3545,9 @@ export default function App() {
     ).map(([rank, label]) => ({ rank, label }));
 
     return { points, xMin, xMax, yMin, yMax, ticks };
-  }, [bonds, issuerTableEnrichment, afterTaxYieldMap]);
+  }, [bonds, issuerTableEnrichment, afterTaxYieldEntries]);
+
+  const ratingChartDataDisplay = useCachedChart(ratingChartData, loading);
 
   useEffect(() => {
     if (bonds.length === 0) return;
@@ -2956,40 +3561,38 @@ export default function App() {
     setGrossIrrChartLoading(true);
     setGrossIrrChartError("");
 
-    Promise.all(
-      missing.map(async (valorId) => {
-        try {
-          const data = await fetchBondDetails(valorId);
-          return { valorId, data };
-        } catch (err) {
-          return { valorId, error: err };
+    const runQueue = async () => {
+      const queue = [...missing];
+      let hadError = false;
+      const concurrency = Math.min(12, queue.length);
+
+      const worker = async () => {
+        while (queue.length > 0 && active) {
+          const valorId = queue.shift();
+          if (!valorId) return;
+          try {
+            const data = await fetchBondDetails(valorId);
+            if (!active) return;
+            setGrossIrrChartDetails((prev) => ({ ...prev, [valorId]: data }));
+          } catch (err) {
+            hadError = true;
+            if (!active) return;
+            setGrossIrrChartDetails((prev) => ({ ...prev, [valorId]: { error: true } }));
+          }
         }
-      })
-    )
-      .then((results) => {
-        if (!active) return;
-        setGrossIrrChartDetails((prev) => {
-          const next = { ...prev };
-          results.forEach((result) => {
-            if (result.data) {
-              next[result.valorId] = result.data;
-              return;
-            }
-            if (result.error) {
-              next[result.valorId] = { error: true };
-            }
-          });
-          return next;
-        });
-        if (results.some((result) => result.error)) {
-          setGrossIrrChartError(
-            "Some bonds could not be enriched for gross IRR. Plot uses available data."
-          );
-        }
-      })
-      .finally(() => {
-        if (active) setGrossIrrChartLoading(false);
-      });
+      };
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      if (!active) return;
+      if (hadError) {
+        setGrossIrrChartError(
+          "Some bonds could not be enriched for gross IRR. Plot uses available data."
+        );
+      }
+      setGrossIrrChartLoading(false);
+    };
+
+    runQueue();
 
     return () => {
       active = false;
@@ -3044,6 +3647,8 @@ export default function App() {
     return { points, xMin, xMax, yMin, yMax, ticks };
   }, [bonds, issuerTableEnrichment]);
 
+  const ratingAskChartDataDisplay = useCachedChart(ratingAskChartData, loading);
+
   const grossIrrAskYieldChart = useMemo(() => {
     const points = bonds
       .map((bond) => {
@@ -3085,6 +3690,11 @@ export default function App() {
     return { points, xMin, xMax, yMin, yMax };
   }, [bonds, grossIrrChartDetails]);
 
+  const grossIrrAskYieldChartDisplay = useCachedChart(
+    grossIrrAskYieldChart,
+    grossIrrChartLoading
+  );
+
   const liquidityViolinData = useMemo(() => {
     const points = bonds
       .map((bond) => {
@@ -3113,6 +3723,11 @@ export default function App() {
     }
     return { points, yMin, yMax };
   }, [bonds, grossIrrChartDetails]);
+
+  const liquidityViolinDataDisplay = useCachedChart(
+    liquidityViolinData,
+    grossIrrChartLoading
+  );
 
   const closeDetails = () => {
     issuerEnrichmentRequestId.current += 1;
@@ -3316,11 +3931,6 @@ export default function App() {
   }, [selected, pricing, bondInputs, detail]);
 
   const govCurveYield = useMemo(() => {
-    if (!curve?.points || !Number.isFinite(bondInputs.years)) return null;
-    return interpolateCurveYield(curve.points, bondInputs.years);
-  }, [curve, bondInputs.years]);
-
-  const impliedGovCurveYield = useMemo(() => {
     if (!Number.isFinite(bondInputs.years)) return null;
     const fitPoints = govCurve?.fits?.spline?.length
       ? govCurve.fits.spline
@@ -3328,13 +3938,6 @@ export default function App() {
     if (!fitPoints || fitPoints.length === 0) return null;
     return interpolateCurveYield(fitPoints, bondInputs.years);
   }, [govCurve, bondInputs.years]);
-
-  const govSpreadByYtw = useMemo(() => {
-    if (!Number.isFinite(pricing.yieldToWorst) || !Number.isFinite(govCurveYield)) {
-      return null;
-    }
-    return (pricing.yieldToWorst - govCurveYield) * 100;
-  }, [pricing.yieldToWorst, govCurveYield]);
 
   const govSpreadBySchedule = useMemo(() => {
     const scheduleYield =
@@ -3347,31 +3950,6 @@ export default function App() {
     }
     return (scheduleYield - govCurveYield) * 100;
   }, [actualYieldMetrics, govCurveYield]);
-
-  const impliedGovSpreadByYtw = useMemo(() => {
-    if (!Number.isFinite(pricing.yieldToWorst) || !Number.isFinite(impliedGovCurveYield)) {
-      return null;
-    }
-    return (pricing.yieldToWorst - impliedGovCurveYield) * 100;
-  }, [pricing.yieldToWorst, impliedGovCurveYield]);
-
-  const impliedGovSpreadTooltip = useMemo(() => {
-    return formatImpliedGovSpreadTooltip({
-      yieldToWorst: pricing.yieldToWorst,
-      govYield: impliedGovCurveYield,
-      source: govCurve?.fits?.spline?.length ? "PCHIP fit" : "implied points"
-    });
-  }, [pricing.yieldToWorst, impliedGovCurveYield, govCurve]);
-
-  const govSpreadByYtwTooltip = useMemo(() => {
-    if (!Number.isFinite(govCurveYield)) return "Curve yield unavailable.";
-    return [
-      `YieldToWorst (SIX): ${formatPercent(pricing.yieldToWorst, 2)}`,
-      `Gov curve yield: ${formatPercent(govCurveYield, 2)}`,
-      `Curve date: ${curve?.latest_date || "-"}`,
-      "Spread = (YieldToWorst - gov curve)."
-    ].join("\n");
-  }, [pricing.yieldToWorst, govCurveYield, curve?.latest_date]);
 
   const govSpreadByScheduleTooltip = useMemo(() => {
     if (!actualYieldMetrics) return "Schedule-based yield unavailable.";
@@ -3387,11 +3965,11 @@ export default function App() {
         4
       )}`,
       `Schedule yield: ${formatPercent(scheduleYield, 2)}`,
-      `Gov curve yield: ${formatPercent(govCurveYield, 2)}`,
-      `Curve date: ${curve?.latest_date || "-"}`,
+      `Gov curve yield (Swissies): ${formatPercent(govCurveYield, 2)}`,
+      `Curve fit: ${govCurve?.fits?.spline?.length ? "PCHIP fit" : "implied points"}`,
       "Spread = (schedule yield - gov curve)."
     ].join("\n");
-  }, [actualYieldMetrics, govCurveYield, curve?.latest_date]);
+  }, [actualYieldMetrics, govCurveYield, govCurve]);
 
   const actualTimingScenarioLast = useMemo(() => {
     if (!actualYieldMetrics) return null;
@@ -3594,50 +4172,15 @@ export default function App() {
     return [purchaseRow, ...rows];
   }, [cashflowSchedule, pricing, notional, bondInputs, detail, selected]);
 
-  const scenarioAsk = useMemo(() => {
-    if (!selected) return null;
-    return computeScenario({
-      price: pricing.ask,
-      couponRate: bondInputs.couponRate,
-      years: bondInputs.years,
-      frequency: bondInputs.frequency,
-      notional,
-      yieldToWorst: pricing.yieldToWorst,
-      fees: feeInputs,
-      taxRate: taxRate / 100,
-      periodsOverride: schedulePeriods
-    });
-  }, [selected, pricing, bondInputs, notional, feeInputs, taxRate, schedulePeriods]);
-
-  const scenarioMid = useMemo(() => {
-    if (!selected) return null;
-    return computeScenario({
-      price: pricing.mid,
-      couponRate: bondInputs.couponRate,
-      years: bondInputs.years,
-      frequency: bondInputs.frequency,
-      notional,
-      yieldToWorst: pricing.yieldToWorst,
-      fees: feeInputs,
-      taxRate: taxRate / 100,
-      periodsOverride: schedulePeriods
-    });
-  }, [selected, pricing, bondInputs, notional, feeInputs, taxRate, schedulePeriods]);
-
-  const scenarioLast = useMemo(() => {
-    if (!selected) return null;
-    return computeScenario({
-      price: pricing.lastPrice,
-      couponRate: bondInputs.couponRate,
-      years: bondInputs.years,
-      frequency: bondInputs.frequency,
-      notional,
-      yieldToWorst: pricing.yieldToWorst,
-      fees: feeInputs,
-      taxRate: taxRate / 100,
-      periodsOverride: schedulePeriods
-    });
-  }, [selected, pricing, bondInputs, notional, feeInputs, taxRate, schedulePeriods]);
+  const formatPriceAssumption = (price) => {
+    if (!Number.isFinite(price)) return "Assumed clean/dirty: -";
+    const accrued = actualYieldMetrics?.accrued;
+    const dirty = Number.isFinite(accrued) ? price + accrued : null;
+    if (Number.isFinite(dirty)) {
+      return `Assumed clean ${formatNumber(price, 2)} / dirty ${formatNumber(dirty, 2)}`;
+    }
+    return `Assumed clean ${formatNumber(price, 2)} / dirty -`;
+  };
 
   const portfolioSet = useMemo(
     () => new Set(portfolio.map((holding) => holding.valorId)),
@@ -3645,7 +4188,7 @@ export default function App() {
   );
   const portfolioBasisLabel = portfolioPricingBasis === "last" ? "last" : "ask";
   const portfolioCostTooltip = `Sum((${portfolioBasisLabel} price / 100) * notional).`;
-  const portfolioAvgYieldTooltip = `Sum(${portfolioBasisLabel} yield * notional) / Sum(notional).`;
+  const portfolioAvgYieldTooltip = "Weighted average SIX YTW (ask) across holdings.";
 
   const resolveHoldingInputs = (holding, pricingBasis) => {
     const bond = holding.bond || {};
@@ -3733,6 +4276,32 @@ export default function App() {
   const portfolioStats = useMemo(() => {
     if (portfolio.length === 0) return null;
 
+    const baseDate = (() => {
+      let earliest = null;
+      portfolio.forEach((holding) => {
+        const detailEntry = portfolioDetails[holding.valorId];
+        if (!detailEntry || detailEntry.error) return;
+        const market = detailEntry.market || {};
+        const bond = holding.bond || {};
+        const raw = market.MarketDate ?? market.LatestTradeDate ?? bond.MarketDate;
+        const parsed = parseDateValue(raw);
+        if (!parsed) return;
+        const day = startOfDay(parsed);
+        if (!earliest || day < earliest) {
+          earliest = day;
+        }
+      });
+      return earliest || startOfDay(new Date());
+    })();
+
+    const shiftCashflows = (cashflows, settlementDate) => {
+      if (!cashflows || cashflows.length === 0) return [];
+      if (!settlementDate) return cashflows;
+      const delta = yearFraction30E360(baseDate, settlementDate);
+      if (!Number.isFinite(delta) || delta === 0) return cashflows;
+      return cashflows.map((flow) => ({ ...flow, t: flow.t + delta }));
+    };
+
     let totalNotional = 0;
     let totalCost = 0;
     let totalGross = 0;
@@ -3757,6 +4326,7 @@ export default function App() {
       const couponRate = inputs.couponRate;
       const askYield = inputs.yieldToWorst;
       const price = inputs.price;
+      const detailEntry = portfolioDetails[holding.valorId];
       const periodsOverride = countCashflowPeriods({
         maturityDate: inputs.maturityDate,
         frequency: inputs.frequency
@@ -3790,19 +4360,27 @@ export default function App() {
         taxRate: taxRate / 100,
         periodsOverride
       });
+      const dirtyScenario = computeDirtyYtwScenarioForBond({
+        bond: inputs.bond,
+        detail: detailEntry,
+        taxRate: taxRate / 100,
+        fees: feeInputs,
+        notional: notionalValue
+      });
+      const scenarioForTotals = dirtyScenario?.scenario || scenario;
 
-      if (Number.isFinite(scenario?.tradeValue)) {
-        totalCost += scenario.tradeValue;
+      if (Number.isFinite(scenarioForTotals?.tradeValue)) {
+        totalCost += scenarioForTotals.tradeValue;
       }
 
-      if (Number.isFinite(scenario?.grossAbs)) totalGross += scenario.grossAbs;
-      if (Number.isFinite(scenario?.feeAbs)) totalFee += scenario.feeAbs;
-      if (Number.isFinite(scenario?.taxAbs)) totalTax += scenario.taxAbs;
-      if (Number.isFinite(scenario?.buyFee)) {
-        totalBuyFees += scenario.buyFee;
+      if (Number.isFinite(scenarioForTotals?.grossAbs)) totalGross += scenarioForTotals.grossAbs;
+      if (Number.isFinite(scenarioForTotals?.feeAbs)) totalFee += scenarioForTotals.feeAbs;
+      if (Number.isFinite(scenarioForTotals?.taxAbs)) totalTax += scenarioForTotals.taxAbs;
+      if (Number.isFinite(scenarioForTotals?.buyFee)) {
+        totalBuyFees += scenarioForTotals.buyFee;
       }
-      if (Number.isFinite(scenario?.buyFee) && Number.isFinite(scenario?.sellFee)) {
-        totalRoundTripFees += scenario.buyFee + scenario.sellFee;
+      if (Number.isFinite(scenarioForTotals?.buyFee) && Number.isFinite(scenarioForTotals?.sellFee)) {
+        totalRoundTripFees += scenarioForTotals.buyFee + scenarioForTotals.sellFee;
       }
 
       const liquidityHaircut = computeLiquidityHaircut(
@@ -3816,19 +4394,37 @@ export default function App() {
         liquiditySamples += 1;
       }
 
-      const cashflows = buildCashflows({
-        price,
-        couponRate,
-        years,
-        frequency: inputs.frequency,
-        notional: notionalValue,
-        fees: feeInputs,
-        taxRate: taxRate / 100,
-        periodsOverride
-      });
-      cashflowsGross.push(...cashflows.cashflowsGross);
-      cashflowsFee.push(...cashflows.cashflowsFee);
-      cashflowsTax.push(...cashflows.cashflowsTax);
+      if (dirtyScenario?.cashflowsGross?.length) {
+        const shiftedGross = shiftCashflows(
+          dirtyScenario.cashflowsGross,
+          dirtyScenario.settlementDate
+        );
+        const shiftedFee = shiftCashflows(
+          dirtyScenario.cashflowsFee,
+          dirtyScenario.settlementDate
+        );
+        const shiftedTax = shiftCashflows(
+          dirtyScenario.cashflowsTax,
+          dirtyScenario.settlementDate
+        );
+        cashflowsGross.push(...shiftedGross);
+        cashflowsFee.push(...shiftedFee);
+        cashflowsTax.push(...shiftedTax);
+      } else {
+        const cashflows = buildCashflows({
+          price,
+          couponRate,
+          years,
+          frequency: inputs.frequency,
+          notional: notionalValue,
+          fees: feeInputs,
+          taxRate: taxRate / 100,
+          periodsOverride
+        });
+        cashflowsGross.push(...cashflows.cashflowsGross);
+        cashflowsFee.push(...cashflows.cashflowsFee);
+        cashflowsTax.push(...cashflows.cashflowsTax);
+      }
     });
 
     return {
@@ -3939,8 +4535,151 @@ export default function App() {
     return { loaded, total: portfolio.length };
   }, [portfolio, portfolioDetails]);
 
+  if (!authReady) {
+    return (
+      <div className="auth-gate">
+        <div className="auth-card">
+          <h2>Loading…</h2>
+        </div>
+      </div>
+    );
+  }
+
+  if (authRequired && !authOk) {
+    return (
+      <div className="auth-gate">
+        <div className="auth-card">
+          <h2>Private access</h2>
+          <p>Enter the access password to continue.</p>
+          <form onSubmit={handleAuthSubmit}>
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              placeholder="Password"
+            />
+            <button type="submit">Unlock</button>
+          </form>
+          {authError ? <p className="error">{authError}</p> : null}
+        </div>
+      </div>
+    );
+  }
+
+  const assumptionsPanel = (
+    <div className="assumption-card">
+      <div>
+        <span className="label">Fees &amp; tax assumptions</span>
+        <strong>Used across search results and portfolio math</strong>
+      </div>
+      <div className="assumption-fields">
+        <label>
+          Marginal income tax (%)
+          <input
+            type="number"
+            value={taxRate}
+            onChange={(event) => setTaxRate(Number(event.target.value) || 0)}
+          />
+        </label>
+        <div className="commission-block">
+          <span className="label">Commissions (tiered)</span>
+          <div className="commission-grid">
+            <label>
+              Tier 1 notional (CHF)
+              <input
+                type="number"
+                value={commissionTierOneNotional}
+                onChange={(event) =>
+                  setCommissionTierOneNotional(Number(event.target.value) || 0)
+                }
+              />
+            </label>
+            <label>
+              Tier 1 rate (%)
+              <input
+                type="number"
+                step="0.01"
+                value={commissionTierOneRate}
+                onChange={(event) =>
+                  setCommissionTierOneRate(Number(event.target.value) || 0)
+                }
+              />
+            </label>
+            <label>
+              Tier 2 rate (%)
+              <input
+                type="number"
+                step="0.001"
+                value={commissionTierTwoRate}
+                onChange={(event) =>
+                  setCommissionTierTwoRate(Number(event.target.value) || 0)
+                }
+              />
+            </label>
+          </div>
+          <p className="meta">Applied to both buy and sell trades.</p>
+        </div>
+      </div>
+    </div>
+  );
+
+  const curvePanel = (
+    <div className="chart-card curve-card">
+      <div className="chart-header">
+        <h3>Swiss government curves</h3>
+        <span>
+          {curve?.latest_date
+            ? `SNB latest ${curve.latest_date}`
+            : "SNB curve (latest)"}
+        </span>
+      </div>
+      <div className="curve-legend">
+        <div className="legend-item">
+          <span className="legend-swatch snb" />
+          <span>SNB curve</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-swatch gov" />
+          <span>Swissies (raw)</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-swatch spline" />
+          <span>PCHIP fit</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-swatch nelson" />
+          <span>Nelson–Siegel fit</span>
+        </div>
+      </div>
+      {curveLoading || govCurveLoading ? <p className="meta">Loading curve...</p> : null}
+      {curveError ? <p className="error">{curveError}</p> : null}
+      {govCurveError && !(govCurve?.points && govCurve.points.length > 0) ? (
+        <p className="error">{govCurveError}</p>
+      ) : null}
+      {!curveLoading && !curveError ? (
+        curve?.points && curve.points.length > 1 ? (
+          <CurveChart
+            points={curve.points}
+            govPoints={govCurve?.points}
+            govFits={govCurve?.fits}
+            onPointClick={(bond) => openDetails(bond)}
+          />
+        ) : (
+          <p className="meta">No SNB curve data available.</p>
+        )
+      ) : null}
+      {govCurve?.points && govCurve.points.length > 0 ? (
+        <p className="meta">
+          Implied curve from {govCurve.count || govCurve.points.length} Swiss
+          Confederation bonds (dashed). PCHIP fit in teal, Nelson–Siegel in green.
+          Gov spread uses the Swissies fit.
+        </p>
+      ) : null}
+    </div>
+  );
+
   return (
-    <div className="app">
+    <div className={`app ${view === "search" ? "is-search" : "is-portfolio"}`}>
       <header className="hero">
         <div>
           <p className="eyebrow">Versified Bond Portfolio</p>
@@ -3983,322 +4722,442 @@ export default function App() {
         </button>
       </nav>
 
-      <div className="assumption-card">
+      {view === "search" ? (
         <div>
-          <span className="label">Global assumptions</span>
-          <strong>Used for portfolio + detail calculations</strong>
-        </div>
-        <div className="assumption-fields">
-          <label>
-            Marginal income tax (%)
-            <input
-              type="number"
-              value={taxRate}
-              onChange={(event) => setTaxRate(Number(event.target.value) || 0)}
-            />
-          </label>
-          <div className="commission-block">
-            <span className="label">Commissions (tiered)</span>
-            <div className="commission-grid">
-              <label>
-                Tier 1 notional (CHF)
-                <input
-                  type="number"
-                  value={commissionTierOneNotional}
-                  onChange={(event) =>
-                    setCommissionTierOneNotional(Number(event.target.value) || 0)
-                  }
-                />
-              </label>
-              <label>
-                Tier 1 rate (%)
-                <input
-                  type="number"
-                  step="0.01"
-                  value={commissionTierOneRate}
-                  onChange={(event) =>
-                    setCommissionTierOneRate(Number(event.target.value) || 0)
-                  }
-                />
-              </label>
-              <label>
-                Tier 2 rate (%)
-                <input
-                  type="number"
-                  step="0.001"
-                  value={commissionTierTwoRate}
-                  onChange={(event) =>
-                    setCommissionTierTwoRate(Number(event.target.value) || 0)
-                  }
-                />
-              </label>
+          <div className={`assumption-drawer ${assumptionsOpen ? "is-open" : ""}`}>
+            <div className="assumption-drawer-header">
+              <div>
+                <p className="eyebrow">Fees &amp; tax assumptions</p>
+                <p className="meta">Applies to search rankings, charts, and portfolio views.</p>
+              </div>
+              <button type="button" className="ghost" onClick={() => setAssumptionsOpen((prev) => !prev)}>
+                {assumptionsOpen ? "Collapse" : "Edit assumptions"}
+              </button>
             </div>
-            <p className="meta">Applied to both buy and sell trades.</p>
+            {assumptionsOpen ? (
+              <div className="assumption-drawer-body">
+                {assumptionsPanel}
+                {curvePanel}
+                <div className="assumption-drawer-actions">
+                  <button type="button" onClick={() => setAssumptionsOpen(false)}>
+                    Save &amp; collapse
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
-        </div>
-      </div>
+          <section className="search-flow">
+          <section className="flow-section flow-define">
+            <div className="section-header">
+              <div>
+                <h2>Define your universe</h2>
+                <p>Start broad, then refine for yield, spread, and sector.</p>
+              </div>
+              <div className="quick-presets">
+                <span className="meta">Quick presets</span>
+                <div className="preset-buttons">
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() =>
+                      applyPreset(
+                        { maturityBucket: "lt1", currency: "CHF", country: "CH" },
+                        {
+                          label: "Short CHF",
+                          detail: "Maturity < 1y · CHF · CH"
+                        }
+                      )
+                    }
+                  >
+                    Short CHF
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() =>
+                      applyPreset(
+                        { afterTaxMin: "1.5" },
+                        {
+                          label: "High after-tax",
+                          detail: "IRR (after-tax) ≥ 1.5%"
+                        }
+                      )
+                    }
+                  >
+                    High after-tax
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() =>
+                      applyPreset(
+                        { govSpreadMax: "0.4" },
+                        {
+                          label: "Low gov spread (YTW)",
+                          detail: "Gov spread (YTW) ≤ 0.4%"
+                        }
+                      )
+                    }
+                  >
+                    Low gov spread
+                  </button>
+                </div>
+                {activePreset ? (
+                  <div className="preset-status">
+                    <span className="meta">
+                      Preset: <strong>{activePreset.label}</strong> · {activePreset.detail}
+                    </span>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => setActivePreset(null)}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <form className="filter-card" onSubmit={handleSearch}>
+              <div className="filter-grid">
+                <label>
+                  Maturity bucket
+                  <select
+                    value={filters.maturityBucket}
+                    onChange={(event) =>
+                      setFilters({ ...filters, maturityBucket: event.target.value })
+                    }
+                  >
+                    {MATURITY_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Currency
+                  <select
+                    value={filters.currency}
+                    onChange={(event) =>
+                      setFilters({ ...filters, currency: event.target.value })
+                    }
+                  >
+                    {CURRENCY_OPTIONS.map((currency) => (
+                      <option key={currency} value={currency}>
+                        {currency}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Issuer country
+                  <input
+                    type="text"
+                    value={filters.country}
+                    maxLength={4}
+                    onChange={(event) =>
+                      setFilters({ ...filters, country: event.target.value.toUpperCase() })
+                    }
+                  />
+                </label>
+                <label>
+                  Sector
+                  <select
+                    value={filters.industrySector}
+                    onChange={(event) =>
+                      setFilters({ ...filters, industrySector: event.target.value })
+                    }
+                  >
+                    <option value="">All</option>
+                    {sectorOptions.map((sector) => (
+                      <option key={sector} value={sector}>
+                        {sector}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="refine-panel">
+                <div className="refine-header">
+                  <span className="label">Refine results</span>
+                  <span className="meta">Adjust filters below to tighten the list.</span>
+                </div>
+                <div className="refine-grid">
+                  <label>
+                    Results per page
+                    <input
+                      type="number"
+                      min="1"
+                      max="200"
+                      value={pageSize}
+                      onChange={(event) => {
+                        const nextValue = Number(event.target.value);
+                        setPageSizeTouched(true);
+                        setPageSize(
+                          Number.isFinite(nextValue) && nextValue > 0 ? nextValue : 200
+                        );
+                      }}
+                    />
+                  </label>
+                  <label>
+                    Vegan friendly
+                    <select
+                      value={filters.veganFilter}
+                      onChange={(event) =>
+                        setFilters({ ...filters, veganFilter: event.target.value })
+                      }
+                    >
+                      <option value="">All</option>
+                      <option value="yes">Yes</option>
+                      <option value="no">No</option>
+                      <option value="unknown">Unknown</option>
+                    </select>
+                  </label>
+                  <label className={afterTaxActive ? "" : "is-inactive"}>
+                    IRR (after-tax) ≥ (%)
+                    <input
+                      type="range"
+                      min={valueFilterRanges.afterTaxMin}
+                      max={valueFilterRanges.afterTaxMax}
+                      step="0.1"
+                      value={afterTaxSliderValue}
+                      onChange={(event) =>
+                        setFilters({
+                          ...filters,
+                          afterTaxMin: Number(event.target.value).toFixed(1)
+                        })
+                      }
+                    />
+                    <div className="slider-range">
+                      <span>{formatNumber(valueFilterRanges.afterTaxMin, 1)}%</span>
+                      <span>{formatNumber(valueFilterRanges.afterTaxMax, 1)}%</span>
+                    </div>
+                    {!afterTaxActive ? (
+                      <span className="slider-status">No min applied</span>
+                    ) : null}
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={filters.afterTaxMin}
+                      onChange={(event) =>
+                        setFilters({ ...filters, afterTaxMin: event.target.value })
+                      }
+                      placeholder="No min"
+                    />
+                  </label>
+                  <label className={govSpreadActive ? "" : "is-inactive"}>
+                    Gov spread (YTW) ≤ (%)
+                    <input
+                      type="range"
+                      min={valueFilterRanges.govSpreadMin}
+                      max={valueFilterRanges.govSpreadMax}
+                      step="0.1"
+                      value={govSpreadSliderValue}
+                      onChange={(event) =>
+                        setFilters({
+                          ...filters,
+                          govSpreadMax: Number(event.target.value).toFixed(1)
+                        })
+                      }
+                    />
+                    <div className="slider-range">
+                      <span>{formatNumber(valueFilterRanges.govSpreadMin, 1)}%</span>
+                      <span>{formatNumber(valueFilterRanges.govSpreadMax, 1)}%</span>
+                    </div>
+                    {!govSpreadActive ? (
+                      <span className="slider-status">No max applied</span>
+                    ) : null}
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={filters.govSpreadMax}
+                      onChange={(event) =>
+                        setFilters({ ...filters, govSpreadMax: event.target.value })
+                      }
+                      placeholder="No max"
+                    />
+                  </label>
+                </div>
+              </div>
+              <div className="filter-actions">
+                <button type="submit" disabled={loading}>
+                  {loading ? "Loading..." : "Fetch bonds"}
+                </button>
+                <button type="button" className="ghost" onClick={resetSearchFilters}>
+                  Reset
+                </button>
+                <span className="meta">{total ? `${total} matches` : ""}</span>
+              </div>
+              {error ? <p className="error">{error}</p> : null}
+            </form>
+          </section>
 
-      {view === "search" ? (
-        <form className="filter-card" onSubmit={handleSearch}>
-          <div className="filter-grid">
-            <label>
-              Maturity bucket
-              <select
-                value={filters.maturityBucket}
-                onChange={(event) =>
-                  setFilters({ ...filters, maturityBucket: event.target.value })
-                }
-              >
-                {MATURITY_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Currency
-              <select
-                value={filters.currency}
-                onChange={(event) =>
-                  setFilters({ ...filters, currency: event.target.value })
-                }
-              >
-                {CURRENCY_OPTIONS.map((currency) => (
-                  <option key={currency} value={currency}>
-                    {currency}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Issuer country
-              <input
-                type="text"
-                value={filters.country}
-                maxLength={4}
-                onChange={(event) =>
-                  setFilters({ ...filters, country: event.target.value.toUpperCase() })
-                }
-              />
-            </label>
-            <label>
-              Sector
-              <select
-                value={filters.industrySector}
-                onChange={(event) =>
-                  setFilters({ ...filters, industrySector: event.target.value })
-                }
-              >
-                <option value="">All</option>
-                {sectorOptions.map((sector) => (
-                  <option key={sector} value={sector}>
-                    {sector}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Results per page
-              <input
-                type="number"
-                min="10"
-                max="200"
-                value={pageSize}
-                onChange={(event) => setPageSize(Number(event.target.value) || 50)}
-              />
-            </label>
-          </div>
-          <div className="filter-actions">
-            <button type="submit" disabled={loading}>
-              {loading ? "Loading..." : "Fetch bonds"}
-            </button>
-            <span className="meta">{total ? `${total} matches` : ""}</span>
-          </div>
-          {error ? <p className="error">{error}</p> : null}
-        </form>
-      ) : null}
+          <section className="flow-section flow-explore">
+            <div className="section-header">
+              <div>
+                <h2>Explore</h2>
+                <p>Switch chart views to spot patterns fast.</p>
+              </div>
+              <div className="chart-controls">
+                <label>
+                  Primary chart
+                  <select
+                    value={chartMode}
+                    onChange={(event) => setChartMode(event.target.value)}
+                  >
+                    <option value="maturity-ask">Maturity vs ask yield</option>
+                    <option value="maturity-after-tax">Maturity vs IRR (after-tax)</option>
+                    <option value="gov-after-tax">Gov spread (YTW) vs IRR (after-tax)</option>
+                    <option value="rating-after-tax">S&P rating vs IRR (after-tax)</option>
+                    <option value="rating-ask">S&P rating vs ask yield</option>
+                    <option value="liquidity">Bid/ask spread distribution</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setShowChart((prev) => !prev)}
+                >
+                  {showChart ? "Hide Charts" : "Show Charts"}
+                </button>
+              </div>
+            </div>
+            {showChart ? (
+              <>
+                {chartMode === "maturity-ask" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>Maturity vs ask yield</h3>
+                      <span>{chartDataDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {chartDataDisplay.points.length === 0 ? (
+                      <p className="meta">No yield/maturity data available for this filter.</p>
+                    ) : (
+                      <ScatterPlot
+                        data={chartDataDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                      />
+                    )}
+                  </div>
+                ) : null}
+                {chartMode === "maturity-after-tax" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>Maturity vs IRR (after-tax)</h3>
+                      <span>{afterTaxChartDataDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {afterTaxChartDataDisplay.points.length === 0 ? (
+                      <p className="meta">No after-tax IRR data available.</p>
+                    ) : (
+                      <ScatterPlot
+                        data={afterTaxChartDataDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                        yLabel="IRR (after-tax) (%)"
+                      />
+                    )}
+                  </div>
+                ) : null}
+                {chartMode === "gov-after-tax" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>Gov spread (YTW) vs IRR (after-tax)</h3>
+                      <span>{afterTaxGovSpreadChartDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {afterTaxGovSpreadChartDisplay.regression ? (
+                      <p className="meta">
+                        {`y = ${afterTaxGovSpreadChartDisplay.regression.slope.toFixed(3)}x + ${afterTaxGovSpreadChartDisplay.regression.intercept.toFixed(3)}`}
+                      </p>
+                    ) : null}
+                    {afterTaxGovSpreadChartDisplay.points.length === 0 ? (
+                      <p className="meta">No gov spread (YTW) data available.</p>
+                    ) : (
+                      <XYScatterPlot
+                        data={afterTaxGovSpreadChartDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                        xLabel="Gov spread (YTW) (%)"
+                        yLabel="IRR (after-tax) (%)"
+                      />
+                    )}
+                  </div>
+                ) : null}
+                {chartMode === "rating-after-tax" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>S&amp;P rating vs IRR (after-tax)</h3>
+                      <span>{ratingChartDataDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {ratingChartDataDisplay.points.length === 0 ? (
+                      <p className="meta">No S&amp;P ratings with after-tax IRR available.</p>
+                    ) : (
+                      <RatingScatterPlot
+                        data={ratingChartDataDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                        xLabel="S&P rating"
+                        yLabel="IRR (after-tax) (%)"
+                      />
+                    )}
+                  </div>
+                ) : null}
+                {chartMode === "rating-ask" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>S&amp;P rating vs ask yield</h3>
+                      <span>{ratingAskChartDataDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {ratingAskChartDataDisplay.points.length === 0 ? (
+                      <p className="meta">No S&amp;P ratings with ask yield available.</p>
+                    ) : (
+                      <RatingScatterPlot
+                        data={ratingAskChartDataDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                        xLabel="S&P rating"
+                        yLabel="Ask yield (%)"
+                      />
+                    )}
+                  </div>
+                ) : null}
+                {chartMode === "liquidity" ? (
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <h3>Avg bid/ask spread distribution (last 5 days)</h3>
+                      <span>{liquidityViolinDataDisplay.points.length} bonds plotted</span>
+                    </div>
+                    {grossIrrChartLoading ? (
+                      <p className="meta">Loading liquidity spreads...</p>
+                    ) : null}
+                    {!grossIrrChartLoading && liquidityViolinDataDisplay.points.length === 0 ? (
+                      <p className="meta">No liquidity spread history available yet.</p>
+                    ) : null}
+                    {!grossIrrChartLoading && liquidityViolinDataDisplay.points.length > 0 ? (
+                      <ViolinPlot
+                        data={liquidityViolinDataDisplay}
+                        onPointClick={(bond) => openDetails(bond)}
+                        yLabel="Avg spread (%)"
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <p className="meta">Charts are hidden. Turn them on to explore patterns.</p>
+            )}
+          </section>
 
-      {view === "search" ? (
-        <section className="results">
-        <div className="section-header">
-          <div>
-            <h2>Results</h2>
-            <p>Click a bond to open the detail sheet.</p>
-          </div>
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setShowChart((prev) => !prev)}
-          >
-            {showChart ? "Hide Charts" : "View Charts"}
-          </button>
-        </div>
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>Maturity vs ask yield</h3>
-              <span>{chartData.points.length} bonds plotted</span>
+          <section className="flow-section flow-act">
+            <div className="section-header">
+              <div>
+                <h2>Act</h2>
+                <p>Click a bond to open the detail sheet.</p>
+              </div>
+              <div className="results-meta">
+                <span className="meta">{total ? `${total} matches` : "No matches yet"}</span>
+                <span className="meta">
+                  Sorted by {sortLabelMap[sortState.key] || sortState.key}
+                </span>
+              </div>
             </div>
-            {chartData.points.length === 0 ? (
-              <p className="meta">No yield/maturity data available for this filter.</p>
-            ) : (
-              <ScatterPlot
-                data={chartData}
-                onPointClick={(bond) => openDetails(bond)}
-              />
-            )}
-          </div>
-        ) : null}
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>Maturity vs after-tax yield</h3>
-              <span>{afterTaxChartData.points.length} bonds plotted</span>
-            </div>
-            {afterTaxChartData.points.length === 0 ? (
-              <p className="meta">No after-tax yield data available.</p>
-            ) : (
-              <ScatterPlot
-                data={afterTaxChartData}
-                onPointClick={(bond) => openDetails(bond)}
-                yLabel="After-tax yield (%)"
-              />
-            )}
-          </div>
-        ) : null}
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>S&amp;P rating vs after-tax yield</h3>
-              <span>{ratingChartData.points.length} bonds plotted</span>
-            </div>
-            {ratingChartData.points.length === 0 ? (
-              <p className="meta">No S&amp;P ratings with after-tax yield available.</p>
-            ) : (
-              <RatingScatterPlot
-                data={ratingChartData}
-                onPointClick={(bond) => openDetails(bond)}
-                xLabel="S&P rating"
-                yLabel="After-tax yield (%)"
-              />
-            )}
-          </div>
-        ) : null}
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>S&amp;P rating vs ask yield</h3>
-              <span>{ratingAskChartData.points.length} bonds plotted</span>
-            </div>
-            {ratingAskChartData.points.length === 0 ? (
-              <p className="meta">No S&amp;P ratings with ask yield available.</p>
-            ) : (
-              <RatingScatterPlot
-                data={ratingAskChartData}
-                onPointClick={(bond) => openDetails(bond)}
-                xLabel="S&P rating"
-                yLabel="Ask yield (%)"
-              />
-            )}
-          </div>
-        ) : null}
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>Gross IRR vs SIX ask yield</h3>
-              <span>{grossIrrAskYieldChart.points.length} bonds plotted</span>
-            </div>
-            {grossIrrChartLoading ? (
-              <p className="meta">Loading gross IRR points...</p>
-            ) : null}
-            {grossIrrChartError ? <p className="error">{grossIrrChartError}</p> : null}
-            {!grossIrrChartLoading && grossIrrAskYieldChart.points.length === 0 ? (
-              <p className="meta">No gross IRR data available yet.</p>
-            ) : null}
-            {!grossIrrChartLoading && grossIrrAskYieldChart.points.length > 0 ? (
-              <XYScatterPlot
-                data={grossIrrAskYieldChart}
-                onPointClick={(bond) => openDetails(bond)}
-                xLabel="Gross IRR (%)"
-                yLabel="SIX ask yield (%)"
-              />
-            ) : null}
-          </div>
-        ) : null}
-        {showChart ? (
-          <div className="chart-card">
-            <div className="chart-header">
-              <h3>Avg bid/ask spread distribution (last 5 days)</h3>
-              <span>{liquidityViolinData.points.length} bonds plotted</span>
-            </div>
-            {grossIrrChartLoading ? (
-              <p className="meta">Loading liquidity spreads...</p>
-            ) : null}
-            {!grossIrrChartLoading && liquidityViolinData.points.length === 0 ? (
-              <p className="meta">No liquidity spread history available yet.</p>
-            ) : null}
-            {!grossIrrChartLoading && liquidityViolinData.points.length > 0 ? (
-              <ViolinPlot
-                data={liquidityViolinData}
-                onPointClick={(bond) => openDetails(bond)}
-                yLabel="Avg spread (%)"
-              />
-            ) : null}
-          </div>
-        ) : null}
-        <div className="chart-card">
-          <div className="chart-header">
-            <h3>SNB Swiss government curve</h3>
-            <span>
-              {curve?.latest_date ? `Latest ${curve.latest_date}` : "Latest curve"}
-            </span>
-          </div>
-          <div className="curve-legend">
-            <div className="legend-item">
-              <span className="legend-swatch snb" />
-              <span>SNB curve</span>
-            </div>
-            <div className="legend-item">
-              <span className="legend-swatch gov" />
-              <span>Implied gov (raw)</span>
-            </div>
-            <div className="legend-item">
-              <span className="legend-swatch spline" />
-              <span>PCHIP fit</span>
-            </div>
-            <div className="legend-item">
-              <span className="legend-swatch nelson" />
-              <span>Nelson–Siegel fit</span>
-            </div>
-          </div>
-          {curveLoading || govCurveLoading ? (
-            <p className="meta">Loading curve...</p>
-          ) : null}
-          {curveError ? <p className="error">{curveError}</p> : null}
-          {govCurveError && !(govCurve?.points && govCurve.points.length > 0) ? (
-            <p className="error">{govCurveError}</p>
-          ) : null}
-          {!curveLoading && !curveError ? (
-            curve?.points && curve.points.length > 1 ? (
-              <CurveChart
-                points={curve.points}
-                govPoints={govCurve?.points}
-                govFits={govCurve?.fits}
-                onPointClick={(bond) => openDetails(bond)}
-              />
-            ) : (
-              <p className="meta">No SNB curve data available.</p>
-            )
-          ) : null}
-          {govCurve?.points && govCurve.points.length > 0 ? (
-            <p className="meta">
-              Implied curve from {govCurve.count || govCurve.points.length} Swiss
-              Confederation bonds (dashed). PCHIP fit in teal, Nelson–Siegel in green.
-            </p>
-          ) : null}
-        </div>
-        <div className="table-wrap results-table">
+            <div className="table-wrap results-table">
           {volumeError ? <p className="error">{volumeError}</p> : null}
           <table>
             <thead>
@@ -4322,6 +5181,18 @@ export default function App() {
                     onClick={() => handleSort("IssuerRating")}
                   >
                     Ratings{sortIndicator("IssuerRating")}
+                  </button>
+                </th>
+                <th
+                  className="vegan-col"
+                  aria-sort={sortState.key === "VeganFriendly" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("VeganFriendly")}
+                  >
+                    Vegan{sortIndicator("VeganFriendly")}
                   </button>
                 </th>
                 <th aria-sort={sortState.key === "ShortName" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"} className="bond-col">
@@ -4363,22 +5234,22 @@ export default function App() {
                     Coupon{sortIndicator("CouponRate")}
                   </button>
                 </th>
-                <th aria-sort={sortState.key === "YieldToWorst" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
-                  <button
-                    type="button"
-                    className="sortable-button"
-                    onClick={() => handleSort("YieldToWorst")}
-                  >
-                    Ask yield{sortIndicator("YieldToWorst")}
-                  </button>
-                </th>
                 <th aria-sort={sortState.key === "AfterTaxYield" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
                   <button
                     type="button"
                     className="sortable-button"
                     onClick={() => handleSort("AfterTaxYield")}
                   >
-                    After-tax yield{sortIndicator("AfterTaxYield")}
+                    IRR (after-tax){sortIndicator("AfterTaxYield")}
+                  </button>
+                </th>
+                <th aria-sort={sortState.key === "AfterTaxGovValue" ? (sortState.dir === "asc" ? "ascending" : "descending") : "none"}>
+                  <button
+                    type="button"
+                    className="sortable-button"
+                    onClick={() => handleSort("AfterTaxGovValue")}
+                  >
+                    After-tax − Gov{sortIndicator("AfterTaxGovValue")}
                   </button>
                 </th>
                 <th
@@ -4399,16 +5270,27 @@ export default function App() {
                     className="sortable-button"
                     onClick={() => handleSort("ImpliedGovSpreadBps")}
                   >
-                    Gov spread{sortIndicator("ImpliedGovSpreadBps")}
+                    Gov spread (YTW){sortIndicator("ImpliedGovSpreadBps")}
                   </button>
                 </th>
-                <th>Info</th>
                 <th>Add</th>
               </tr>
             </thead>
             <tbody>
               {sortedBonds.map((bond) => (
-                <tr key={bond.ValorId}>
+                <tr
+                  key={bond.ValorId}
+                  className={resolveIupFlag(bond) ? "iup-row" : ""}
+                  onClick={(event) => {
+                    if (
+                      event.target instanceof Element &&
+                      event.target.closest("button, a, input, select, textarea")
+                    ) {
+                      return;
+                    }
+                    openDetails(bond);
+                  }}
+                >
                   <td>{bond.IssuerNameFull || "-"}</td>
                   <td className="rating-col">
                     {(() => {
@@ -4453,6 +5335,22 @@ export default function App() {
                       );
                     })()}
                   </td>
+                  <td className="vegan-col">
+                    {(() => {
+                      const issuerName = bond.IssuerNameFull || "";
+                      if (!issuerName) return "—";
+                      const status = resolveVeganStatus(issuerName);
+                      return (
+                        <span
+                          className={`vegan-badge ${
+                            status === "yes" ? "is-yes" : status === "no" ? "is-no" : "is-unknown"
+                          }`}
+                        >
+                          {status === "yes" ? "Yes" : status === "no" ? "No" : "—"}
+                        </span>
+                      );
+                    })()}
+                  </td>
                   <td className="bond-col">{bond.ShortName || "-"}</td>
                   <td className="sector-col">
                     {bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}
@@ -4464,13 +5362,32 @@ export default function App() {
                     </div>
                   </td>
                   <td>{formatPercent(parseNumber(bond.CouponRate), 2)}</td>
-                  <td>{formatPercent(parseNumber(bond.YieldToWorst), 2)}</td>
                   <td>
-                    {Number.isFinite(parseNumber(afterTaxYieldMap[bond.ValorId]?.yield)) ? (
-                      <MetricInline
-                        label={formatPercent(afterTaxYieldMap[bond.ValorId]?.yield, 2)}
-                        tooltip={afterTaxYieldMap[bond.ValorId]?.tooltip}
-                      />
+                    {(() => {
+                      const entry = afterTaxYieldEntries[bond.ValorId];
+                      if (!entry || !Number.isFinite(entry.yield)) return "-";
+                      const label = `${formatPercent(entry.yield, 2)}${
+                        entry.cached ? " (cached)" : ""
+                      }`;
+                      const ytw = formatPercent(parseNumber(bond.YieldToWorst), 2);
+                      const tooltipBase = entry.cached
+                        ? `${entry.tooltip || ""}\nCached estimate from a previous session.`
+                        : entry.tooltip;
+                      const tooltip = [
+                        tooltipBase,
+                        `SIX YTW (ask): ${ytw}`
+                      ].filter(Boolean).join("\n");
+                      return (
+                        <div className="metric-stack">
+                          <MetricInline label={label} tooltip={tooltip} />
+                          <span className="metric-sub">SIX YTW: {ytw}</span>
+                        </div>
+                      );
+                    })()}
+                  </td>
+                  <td>
+                    {Number.isFinite(resolveAfterTaxGovValue(bond)) ? (
+                      `${formatPercent(resolveAfterTaxGovValue(bond), 2)}`
                     ) : (
                       "-"
                     )}
@@ -4530,14 +5447,12 @@ export default function App() {
                     )}
                   </td>
                   <td>
-                    <button type="button" className="ghost" onClick={() => openDetails(bond)}>
-                      Info
-                    </button>
-                  </td>
-                  <td>
                     <button
                       type="button"
-                      onClick={() => addToPortfolio(bond)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        addToPortfolio(bond);
+                      }}
                       disabled={portfolioSet.has(bond.ValorId)}
                     >
                       {portfolioSet.has(bond.ValorId) ? "Added" : "Add"}
@@ -4554,10 +5469,13 @@ export default function App() {
               ) : null}
             </tbody>
           </table>
+            </div>
+          </section>
+            </section>
         </div>
-      </section>
       ) : (
         <section className="results">
+          {assumptionsPanel}
           <div className="section-header">
             <div>
               <h2>Portfolio</h2>
@@ -4633,7 +5551,7 @@ export default function App() {
                     </div>
                     <div>
                       <MetricLabel
-                        label={`Avg ${portfolioBasisLabel} yield`}
+                        label="Avg SIX YTW (ask)"
                         tooltip={portfolioAvgYieldTooltip}
                       />
                       <strong>{formatPercent(portfolioStats?.avgYield, 2)}</strong>
@@ -4661,29 +5579,18 @@ export default function App() {
                       />
                       <strong>{formatCurrency(portfolioStats?.totalTax, 0)}</strong>
                     </div>
-                  </div>
-                </section>
-                <section className="summary-group">
-                  <h4>IRR &amp; fees</h4>
-                  <div className="summary-grid">
-                    <div>
-                      <MetricLabel label="Portfolio IRR" tooltip={METRIC_TOOLTIPS.portfolioIrr} />
-                      <strong>{formatPercent(portfolioStats?.portfolioIrrGross, 2)}</strong>
-                    </div>
                     <div>
                       <MetricLabel
-                        label="Portfolio IRR (fees)"
-                        tooltip={METRIC_TOOLTIPS.portfolioIrrFees}
-                      />
-                      <strong>{formatPercent(portfolioStats?.portfolioIrrFee, 2)}</strong>
-                    </div>
-                    <div>
-                      <MetricLabel
-                        label="Portfolio IRR (fees + tax)"
+                        label="Portfolio IRR (after-tax)"
                         tooltip={METRIC_TOOLTIPS.portfolioIrrFeesTax}
                       />
                       <strong>{formatPercent(portfolioStats?.portfolioIrrTax, 2)}</strong>
                     </div>
+                  </div>
+                </section>
+                <section className="summary-group">
+                  <h4>Costs &amp; liquidity</h4>
+                  <div className="summary-grid">
                     <div>
                       <MetricLabel
                         label="Total buy fees"
@@ -4725,12 +5632,11 @@ export default function App() {
                       <th>Bond</th>
                       <th>Sector</th>
                       <th>Maturity</th>
-                      <th>Yield ({portfolioBasisLabel})</th>
+                      <th>IRR (after-tax)</th>
                       <th>Price ({portfolioBasisLabel})</th>
                       <th>Notional</th>
                       <th>Gross return</th>
                       <th>Liquidity haircut</th>
-                      <th>IRR</th>
                       <th></th>
                     </tr>
                   </thead>
@@ -4742,6 +5648,7 @@ export default function App() {
                       );
                       const bond = inputs.bond || {};
                       const years = inputs.years;
+                      const detailEntry = portfolioDetails[holding.valorId];
                       const periodsOverride = countCashflowPeriods({
                         maturityDate: inputs.maturityDate,
                         frequency: inputs.frequency
@@ -4757,6 +5664,15 @@ export default function App() {
                         taxRate: taxRate / 100,
                         periodsOverride
                       });
+                      const dirtyScenario = computeDirtyYtwScenarioForBond({
+                        bond: inputs.bond,
+                        detail: detailEntry,
+                        taxRate: taxRate / 100,
+                        fees: feeInputs,
+                        notional: holding.notional
+                      });
+                      const afterTaxIrr =
+                        dirtyScenario?.scenario?.taxIrr ?? scenario?.taxIrr;
                       const liquidityHaircut = computeLiquidityHaircut(
                         inputs.liquiditySpread,
                         inputs.price,
@@ -4777,7 +5693,20 @@ export default function App() {
                           <td>{bond.ShortName || "-"}</td>
                           <td>{bond.IndustrySectorDesc || bond.IndustrySectorCode || "-"}</td>
                           <td>{formatDateYMD(bond.MaturityDate)}</td>
-                          <td>{formatPercent(inputs.yieldToWorst, 2)}</td>
+                          <td>
+                            <div className="metric-stack">
+                              <MetricInline
+                                label={formatPercent(afterTaxIrr, 2)}
+                                tooltip={`SIX YTW (ask): ${formatPercent(
+                                  inputs.yieldToWorst,
+                                  2
+                                )}`}
+                              />
+                              <span className="metric-sub">
+                                SIX YTW: {formatPercent(inputs.yieldToWorst, 2)}
+                              </span>
+                            </div>
+                          </td>
                           <td>{formatNumber(inputs.price, 2)}</td>
                           <td>
                             <input
@@ -4802,7 +5731,6 @@ export default function App() {
                               "-"
                             )}
                           </td>
-                          <td>{formatPercent(scenario?.grossIrr, 2)}</td>
                           <td>
                             <button type="button" className="ghost" onClick={() => openDetails(bond)}>
                               Info
@@ -4930,7 +5858,11 @@ export default function App() {
 
       {selected ? (
         <div className="detail-backdrop" onClick={closeDetails}>
-          <aside className="detail-panel" onClick={(event) => event.stopPropagation()}>
+          <aside
+            className="detail-panel"
+            ref={detailPanelRef}
+            onClick={(event) => event.stopPropagation()}
+          >
           <div className="detail-header">
             <div>
               <p className="eyebrow">Bond details</p>
@@ -4968,14 +5900,42 @@ export default function App() {
                 <h4>Issuer & security</h4>
                 <div className="enrichment-card">
                   <div className="enrichment-header">
-                    <div>
+                    <div className="enrichment-titleblock">
                       <p className="eyebrow">Issuer enrichment</p>
-                      <p className="meta">On-demand summary, ratings, and vegan check.</p>
                     </div>
                     <div className="enrichment-actions">
+                      {issuerEnrichment ? (
+                        <button
+                          type="button"
+                          className="enrichment-button primary"
+                          onClick={handleForceRefresh}
+                          disabled={
+                            issuerEnrichmentStatus.state === "loading" ||
+                            issuerEnrichmentStatus.state === "queued"
+                          }
+                        >
+                          Force refresh
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="enrichment-button primary"
+                          onClick={handleEnrichIssuer}
+                          disabled={
+                            issuerEnrichmentStatus.state === "loading" ||
+                            issuerEnrichmentStatus.state === "queued"
+                          }
+                        >
+                          {issuerEnrichmentStatus.state === "loading"
+                            ? "Enriching..."
+                            : issuerEnrichmentStatus.state === "queued"
+                              ? "Queued..."
+                              : "Enrich issuer"}
+                        </button>
+                      )}
                       <button
                         type="button"
-                        className="ghost"
+                        className="enrichment-button ghost"
                         onClick={handleCopyPrompt}
                         disabled={
                           issuerEnrichmentStatus.state === "loading" ||
@@ -4983,32 +5943,6 @@ export default function App() {
                         }
                       >
                         Copy LLM prompt
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={handleForceRefresh}
-                        disabled={
-                          issuerEnrichmentStatus.state === "loading" ||
-                          issuerEnrichmentStatus.state === "queued"
-                        }
-                      >
-                        Force refresh
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={handleEnrichIssuer}
-                        disabled={
-                          issuerEnrichmentStatus.state === "loading" ||
-                          issuerEnrichmentStatus.state === "queued"
-                        }
-                      >
-                        {issuerEnrichmentStatus.state === "loading"
-                          ? "Enriching..."
-                          : issuerEnrichmentStatus.state === "queued"
-                            ? "Queued..."
-                            : "Enrich issuer"}
                       </button>
                     </div>
                   </div>
@@ -5019,19 +5953,30 @@ export default function App() {
                     <p className="meta">{issuerEnrichmentStatus.message}</p>
                   ) : null}
                   {issuerEnrichment ? (
-                    <div className="detail-list enrichment-list">
-                      <div>
-                        <span>Issuer summary</span>
-                        <strong>{issuerEnrichment.summary_md || "-"}</strong>
-                        <div className="detail-subtext enrichment-inline">
-                          <span>Vegan friendly: {formatVeganFriendly(issuerEnrichment.vegan_friendly)}</span>
+                    <div className="enrichment-content">
+                      <div className="enrichment-summary">
+                        <span className="enrichment-label">Issuer summary</span>
+                        <p className="enrichment-text">{issuerEnrichment.summary_md || "-"}</p>
+                        <div className="enrichment-flag">
+                          <span className="enrichment-label">Vegan friendly</span>
+                          <span
+                            className={`vegan-badge ${
+                              issuerEnrichment.vegan_friendly === true || issuerEnrichment.vegan_friendly === 1
+                                ? "is-yes"
+                                : issuerEnrichment.vegan_friendly === false || issuerEnrichment.vegan_friendly === 0
+                                  ? "is-no"
+                                  : "is-unknown"
+                            }`}
+                          >
+                            {formatVeganFriendly(issuerEnrichment.vegan_friendly)}
+                          </span>
                           {issuerEnrichment.vegan_explanation ? (
                             <InfoTooltip text={issuerEnrichment.vegan_explanation} />
                           ) : null}
                         </div>
                       </div>
-                      <div>
-                        <span>Ratings</span>
+                      <div className="enrichment-ratings">
+                        <span className="enrichment-label">Ratings</span>
                         <div className="rating-stack" ref={ratingContainerRef}>
                           <div className="rating-item">
                             <strong>Moody&apos;s</strong>
@@ -5098,6 +6043,12 @@ export default function App() {
                       </div>
                     </div>
                   ) : null}
+                  {issuerEnrichmentDebug ? (
+                    <details className="debug-panel">
+                      <summary>LLM debug output</summary>
+                      <pre>{JSON.stringify(issuerEnrichmentDebug, null, 2)}</pre>
+                    </details>
+                  ) : null}
                 </div>
                 <div className="detail-list">
                   <div>
@@ -5107,6 +6058,37 @@ export default function App() {
                   <div>
                     <span>ISIN</span>
                     <strong>{detail.overview?.isin || "-"}</strong>
+                  </div>
+                  <div>
+                    <span>IUP (ICTax)</span>
+                    <strong>
+                      {(() => {
+                        const isin = selected?.ISIN;
+                        const maturity = String(selected?.MaturityDate || "").replace(/\D/g, "");
+                        const key = `${isin}:${maturity}`;
+                        const entry = iupMap[key];
+                        if (iupStatus.state === "loading") return "Checking…";
+                        if (iupStatus.state === "error") return "Unavailable";
+                        if (!entry || entry.iup === null || entry.iup === undefined) return "Unknown";
+                        return entry.iup ? "Yes" : "No";
+                      })()}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>ICTax link</span>
+                    <strong>
+                      {(() => {
+                        const isin = selected?.ISIN || "";
+                        const maturity = String(selected?.MaturityDate || "").replace(/\D/g, "");
+                        if (!isin) return "-";
+                        const link = `https://www.ictax.admin.ch/extern/en.html#/security/${isin}/${maturity}`;
+                        return (
+                          <a href={link} target="_blank" rel="noreferrer">
+                            Open ICTax
+                          </a>
+                        );
+                      })()}
+                    </strong>
                   </div>
                   <div>
                     <span>Industry sector</span>
@@ -5178,31 +6160,46 @@ export default function App() {
                   <div>
                     <span>Ask / Bid</span>
                     <strong>
-                      {formatNumber(pricing.ask, 2)} / {formatNumber(pricing.bid, 2)}
+                      {Number.isFinite(pricing.ask) && pricing.ask > 0
+                        ? formatNumber(pricing.ask, 2)
+                        : "—"}{" "}
+                      /{" "}
+                      {Number.isFinite(pricing.bid) && pricing.bid > 0
+                        ? formatNumber(pricing.bid, 2)
+                        : "—"}
                     </strong>
                   </div>
                   <div>
                     <span>Mid price</span>
-                    <strong>{formatNumber(pricing.mid, 2)}</strong>
+                    <strong>
+                      {Number.isFinite(pricing.mid) && pricing.mid > 0
+                        ? formatNumber(pricing.mid, 2)
+                        : "-"}
+                    </strong>
                   </div>
                   <div>
-                    <span>Ask yield</span>
+                    <span>SIX YTW (ask)</span>
                     <strong>{formatPercent(pricing.yieldToWorst, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Schedule yield (dirty)</span>
+                    <strong>
+                      {formatPercent(
+                        actualYieldMetrics?.dirtyYtw ??
+                          actualYieldMetrics?.dirtyYtm ??
+                          actualYieldMetrics?.cleanYtw ??
+                          actualYieldMetrics?.cleanYtm,
+                        2
+                      )}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Accrued interest (per 100)</span>
+                    <strong>{formatNumber(actualYieldMetrics?.accrued, 4)}</strong>
                   </div>
                   <div>
                     <span>Previous close</span>
                     <strong>{formatNumber(parseNumber(detail.market?.PreviousClosingPrice), 2)}</strong>
-                  </div>
-                  <div>
-                    <span>Daily range</span>
-                    <strong>
-                      {formatNumber(parseNumber(detail.market?.DailyLowPrice), 2)} -
-                      {formatNumber(parseNumber(detail.market?.DailyHighPrice), 2)}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Mid spread</span>
-                    <strong>{formatPercent(parseNumber(detail.market?.MidSpread), 2)}</strong>
                   </div>
                   <div>
                     <span className="metric-label-inline">
@@ -5217,28 +6214,6 @@ export default function App() {
                             liquidityEstimate.haircutPct,
                             2
                           )})`
-                        : "-"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="metric-label-inline">
-                      Gov spread (YTW, bps)
-                      <InfoTooltip text={govSpreadByYtwTooltip} />
-                    </span>
-                    <strong>
-                      {Number.isFinite(govSpreadByYtw)
-                        ? `${formatNumber(govSpreadByYtw, 1)} bps`
-                        : "-"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="metric-label-inline">
-                      Gov spread (bps)
-                      <InfoTooltip text={impliedGovSpreadTooltip} />
-                    </span>
-                    <strong>
-                      {Number.isFinite(impliedGovSpreadByYtw)
-                        ? `${formatNumber(impliedGovSpreadByYtw, 1)} bps`
                         : "-"}
                     </strong>
                   </div>
@@ -5328,8 +6303,9 @@ export default function App() {
                 </div>
 
                 <div className="calculator-note">
-                  Defaults match IBKR tiered commissions (editable). Returns use a
-                  linear accrual of ask yield and assume mid-price sale.
+                  Defaults match IBKR tiered commissions (editable). Returns use
+                  actual cashflow timing with dirty price and worst-case call vs
+                  maturity.
                 </div>
                 <div className="formula-block">
                   <h5>Break-even formulae</h5>
@@ -5337,7 +6313,7 @@ export default function App() {
                     tradeValue = (price / 100) × notional
                   </p>
                   <p>
-                    annualYieldValue = tradeValue × (askYield / 100)
+                    annualYieldValue = tradeValue × (SIX YTW / 100)
                   </p>
                   <p>
                     annualTax = notional × (couponRate / 100) × (taxRate / 100)
@@ -5352,171 +6328,36 @@ export default function App() {
                 </div>
 
                 <div className="return-grid">
-                  <div className="return-card">
-                    <h5>Yield (actual timing)</h5>
+                <div className="return-card">
+                  <h5>Yield snapshot</h5>
+                  <p>
+                    Primary IRR (after-tax, worst-case):{" "}
+                    <strong>{formatPercent(actualTimingScenarioLast?.taxIrr, 2)}</strong>
+                  </p>
+                  <p>
+                    SIX YTW (ask):{" "}
+                    <strong>{formatPercent(pricing.yieldToWorst, 2)}</strong>
+                  </p>
+                  <p>
+                    Gov spread (schedule):{" "}
+                    {Number.isFinite(govSpreadBySchedule) ? (
+                      <MetricInline
+                        label={`${formatNumber(govSpreadBySchedule, 1)} bps`}
+                        tooltip={govSpreadByScheduleTooltip}
+                      />
+                    ) : (
+                      "-"
+                    )}
+                  </p>
                     <p>
-                      Price basis: {actualYieldMetrics?.priceLabel || "-"} (
-                      {formatNumber(actualYieldMetrics?.cleanPrice, 2)})
-                    </p>
-                    <p>
-                      Accrued interest (30E/360):{" "}
-                      {formatNumber(actualYieldMetrics?.accrued, 4)} → Dirty:{" "}
-                      {formatNumber(actualYieldMetrics?.dirtyPrice, 4)}
+                      Price basis: {actualYieldMetrics?.priceLabel || "-"} (clean{" "}
+                      {formatNumber(actualYieldMetrics?.cleanPrice, 2)}, dirty{" "}
+                      {formatNumber(actualYieldMetrics?.dirtyPrice, 4)})
                     </p>
                     <p>
                       Settlement date: {formatDateYMD(actualYieldMetrics?.settlementDate)}
                     </p>
-                    <p>
-                      Call date: {formatDateYMD(actualYieldMetrics?.callDate) || "-"}
-                    </p>
-                    <p>
-                      Clean YTM: {formatPercent(actualYieldMetrics?.cleanYtm, 2)}
-                    </p>
-                    <p>
-                      Dirty YTM: {formatPercent(actualYieldMetrics?.dirtyYtm, 2)}
-                    </p>
-                    <p>
-                      Clean YTW (call): {formatPercent(actualYieldMetrics?.cleanYtw, 2)}
-                    </p>
-                    <p>
-                      Dirty YTW (call): {formatPercent(actualYieldMetrics?.dirtyYtw, 2)}
-                    </p>
-                  </div>
-                  <div className="return-card">
-                    <h5>Last price</h5>
-                    <p>
-                      <MetricInline
-                        label="Gross return"
-                        tooltip={RETURN_TOOLTIPS.grossReturn}
-                      />
-                      : {formatCurrency(actualTimingScenarioLast?.grossAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
-                      : {formatPercent(actualTimingScenarioLast?.grossIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="SIX ask yield" tooltip="SIX Yield-to-Worst (ask yield)." />
-                      : {formatPercent(pricing.yieldToWorst, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
-                      {formatCurrency(actualTimingScenarioLast?.feeAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
-                      {formatPercent(actualTimingScenarioLast?.feeIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
-                      {formatCurrency(actualTimingScenarioLast?.taxAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
-                      {formatPercent(actualTimingScenarioLast?.taxIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFees}
-                      />
-                      : {formatDurationYears(actualTimingScenarioLast?.breakEvenFees)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees + tax)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
-                      />
-                      : {formatDurationYears(actualTimingScenarioLast?.breakEvenFeesTax)}
-                    </p>
-                  </div>
-                  <div className="return-card">
-                    <h5>Ask price</h5>
-                    <p>
-                      <MetricInline
-                        label="Gross return"
-                        tooltip={RETURN_TOOLTIPS.grossReturn}
-                      />
-                      : {formatCurrency(scenarioAsk?.grossAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
-                      : {formatPercent(scenarioAsk?.grossIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
-                      {formatCurrency(scenarioAsk?.feeAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
-                      {formatPercent(scenarioAsk?.feeIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
-                      {formatCurrency(scenarioAsk?.taxAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
-                      {formatPercent(scenarioAsk?.taxIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFees}
-                      />
-                      : {formatDurationYears(scenarioAsk?.breakEvenFees)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees + tax)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
-                      />
-                      : {formatDurationYears(scenarioAsk?.breakEvenFeesTax)}
-                    </p>
-                  </div>
-                  <div className="return-card">
-                    <h5>Mid price</h5>
-                    <p>
-                      <MetricInline
-                        label="Gross return"
-                        tooltip={RETURN_TOOLTIPS.grossReturn}
-                      />
-                      : {formatCurrency(scenarioMid?.grossAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Gross IRR" tooltip={RETURN_TOOLTIPS.grossIrr} />
-                      : {formatPercent(scenarioMid?.grossIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After fees" tooltip={RETURN_TOOLTIPS.afterFees} />:{" "}
-                      {formatCurrency(scenarioMid?.feeAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Fee IRR" tooltip={RETURN_TOOLTIPS.feeIrr} />:{" "}
-                      {formatPercent(scenarioMid?.feeIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline label="After tax" tooltip={RETURN_TOOLTIPS.afterTax} />:{" "}
-                      {formatCurrency(scenarioMid?.taxAbs)}
-                    </p>
-                    <p>
-                      <MetricInline label="Tax IRR" tooltip={RETURN_TOOLTIPS.taxIrr} />:{" "}
-                      {formatPercent(scenarioMid?.taxIrr, 2)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFees}
-                      />
-                      : {formatDurationYears(scenarioMid?.breakEvenFees)}
-                    </p>
-                    <p>
-                      <MetricInline
-                        label="Break-even (fees + tax)"
-                        tooltip={RETURN_TOOLTIPS.breakEvenFeesTax}
-                      />
-                      : {formatDurationYears(scenarioMid?.breakEvenFeesTax)}
-                    </p>
+                    <p>Call date: {formatDateYMD(actualYieldMetrics?.callDate) || "-"}</p>
                   </div>
                 </div>
               </section>

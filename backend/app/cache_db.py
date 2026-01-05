@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "cache.sqlite"
+logger = logging.getLogger(__name__)
 
 
 def _connect() -> sqlite3.Connection:
@@ -80,6 +82,18 @@ def _now_ts() -> int:
     return int(time.time())
 
 
+def _normalize_issuer_name(name: str) -> str:
+    return (
+        name.lower()
+        .replace(".", "")
+        .replace(",", "")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("-", " ")
+        .replace("/", " ")
+    )
+
+
 def get_issuer_enrichment(issuer_name: str, include_expired: bool = False) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute(
@@ -108,14 +122,15 @@ def get_issuer_enrichments(
     issuer_names: list[str],
     include_expired: bool = False,
 ) -> dict[str, dict]:
-    names = [name for name in issuer_names if name]
-    if not names:
+    raw_names = [name for name in issuer_names if name]
+    if not raw_names:
         return {}
-    placeholders = ",".join("?" for _ in names)
+    normalized = [name.strip().lower() for name in raw_names]
+    placeholders = ",".join("?" for _ in normalized)
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT * FROM issuer_enrichment WHERE issuer_name IN ({placeholders})",
-            names,
+            f"SELECT * FROM issuer_enrichment WHERE lower(issuer_name) IN ({placeholders})",
+            normalized,
         ).fetchall()
     results: dict[str, dict] = {}
     now = _now_ts()
@@ -130,9 +145,64 @@ def get_issuer_enrichments(
         data.pop("sources_json", None)
         if not data.get("pinned"):
             expires_at = data.get("expires_at") or 0
-            if not include_expired and expires_at and expires_at < now:
-                continue
+        if not include_expired and expires_at and expires_at < now:
+            continue
         results[data.get("issuer_name")] = data
+
+    def _has_ratings(data: dict) -> bool:
+        return any(data.get(key) for key in ("moodys", "fitch", "sp"))
+
+    needs_fuzzy = []
+    for name in raw_names:
+        existing = results.get(name)
+        if not existing or not _has_ratings(existing):
+            needs_fuzzy.append(name)
+
+    if needs_fuzzy:
+        with _connect() as conn:
+            all_rows = conn.execute("SELECT * FROM issuer_enrichment").fetchall()
+        enriched = []
+        for row in all_rows:
+            data = dict(row)
+            sources_raw = data.get("sources_json")
+            if sources_raw:
+                try:
+                    data["sources"] = json.loads(sources_raw)
+                except json.JSONDecodeError:
+                    data["sources"] = sources_raw
+            data.pop("sources_json", None)
+            if not data.get("pinned"):
+                expires_at = data.get("expires_at") or 0
+                if not include_expired and expires_at and expires_at < now:
+                    continue
+            enriched.append(data)
+
+        for name in needs_fuzzy:
+            target = _normalize_issuer_name(name)
+            if not target:
+                continue
+            best = None
+            best_score = (-1, -1)
+            for candidate in enriched:
+                cand_name = candidate.get("issuer_name") or ""
+                cand_norm = _normalize_issuer_name(cand_name)
+                if not cand_norm:
+                    continue
+                if target.startswith(cand_norm) or cand_norm.startswith(target):
+                    rating_count = sum(
+                        1 for key in ("moodys", "fitch", "sp") if candidate.get(key)
+                    )
+                    score = (rating_count, len(cand_norm))
+                    if score > best_score:
+                        best_score = score
+                        best = candidate
+            if best:
+                results[name] = best
+                logger.info(
+                    "issuer_enrichment fuzzy match: %s -> %s",
+                    name,
+                    best.get("issuer_name"),
+                )
     return results
 
 

@@ -66,6 +66,7 @@ DETAIL_MARKET_FIELDS = [
 
 LIST_CACHE = TTLCache(ttl_seconds=300)
 DETAIL_CACHE = TTLCache(ttl_seconds=600)
+IUP_CACHE = TTLCache(ttl_seconds=24 * 60 * 60)
 
 GOVERNMENT_ISSUER_NAMES = [
     "SWISS CONFEDERATION",
@@ -77,6 +78,10 @@ GOVERNMENT_ISSUER_NAMES = [
 
 
 class SixClientError(RuntimeError):
+    pass
+
+
+class IctaxClientError(RuntimeError):
     pass
 
 
@@ -196,6 +201,56 @@ def _fetch_json(url: str, cache: Optional[TTLCache] = None) -> Any:
     if cache:
         cache.set(url, data)
     return data
+
+
+def fetch_ictax_security(isin: str, maturity: Optional[str]) -> dict[str, Any]:
+    if not isin:
+        raise IctaxClientError("ISIN required")
+    isin = isin.strip().upper()
+    maturity_key = (maturity or "").strip()
+    cache_key = f"{isin}:{maturity_key}"
+    cached = IUP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    encoded_isin = quote(isin, safe="")
+    encoded_maturity = quote(maturity_key, safe="") if maturity_key else ""
+    url = (
+        "https://www.ictax.admin.ch/extern/en.html"
+        f"?isin={encoded_isin}&maturity={encoded_maturity}&format=json"
+    )
+    with httpx.Client(timeout=15) as client:
+        response = client.get(url)
+    if response.status_code != 200:
+        raise IctaxClientError(f"ICTax request failed: {response.status_code}")
+    data = response.json()
+    IUP_CACHE.set(cache_key, data)
+    return data
+
+
+def extract_iup_flag(payload: Any) -> Optional[bool]:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if "iup" in key_lower:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str):
+                    normalized = value.strip().lower()
+                    if normalized in {"true", "yes", "y", "1"}:
+                        return True
+                    if normalized in {"false", "no", "n", "0"}:
+                        return False
+            nested = extract_iup_flag(value)
+            if nested is not None:
+                return nested
+    if isinstance(payload, list):
+        for item in payload:
+            nested = extract_iup_flag(item)
+            if nested is not None:
+                return nested
+    return None
 
 
 def _rows_to_dicts(data: dict[str, Any]) -> list[dict[str, Any]]:

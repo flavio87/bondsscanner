@@ -77,15 +77,20 @@ def _coerce_bool(value: object) -> Optional[bool]:
 def _build_profile_prompt(issuer_name: str, context: Optional[str]) -> str:
     context_block = context or "No extra context provided."
     return (
-        "You are enriching a bond issuer profile. "
+        "You are classifying whether a company is vegan friendly. "
         "Return JSON with keys: summary_md, vegan_friendly, vegan_explanation, esg_summary.\n"
         "Summary must be exactly one sentence. "
-        "vegan_friendly must be true/false, with a brief explanation in vegan_explanation. "
-        "Set vegan_friendly=false ONLY if there is clear evidence the issuer sells animal-derived products "
-        "OR performs/commissions animal testing. "
-        "Otherwise set vegan_friendly=true (including industries like construction, software, finance). "
-        "If the context is insufficient, return null and state the uncertainty in vegan_explanation. "
-        "Only use the provided context; do not browse or guess.\n\n"
+        "Rules:\n"
+        "- vegan_friendly = false if the company:\n"
+        "  * produces/sells animal-derived food products (meat, dairy, eggs, leather),\n"
+        "  * runs animal agriculture or slaughter/processing,\n"
+        "  * performs or commissions animal testing (including pharmaceuticals/biotech).\n"
+        "- vegan_friendly = true only if there is clear evidence the company does NOT do any of the above.\n"
+        "- For banks, software, construction, and other non-animal industries: default to true unless context indicates involvement in animal testing or animal-derived products.\n"
+        "- For pharma/biotech: default to false unless explicit evidence of no animal testing exists.\n"
+        "- If the context is insufficient, set vegan_friendly = null and say what’s missing.\n"
+        "- If you are unsure, you MAY browse to verify; only browse when needed.\n"
+        "Use provided context first; browse only if needed.\n\n"
         f"Issuer: {issuer_name}\n"
         f"Context:\n{context_block}\n"
     )
@@ -101,6 +106,54 @@ def _build_ratings_prompt(issuer_name: str) -> str:
         "Only use verifiable information; do not guess.\n\n"
         f"Issuer: {issuer_name}\n"
     )
+
+
+def _infer_vegan_friendly(issuer_name: str, context: Optional[str]) -> Optional[bool]:
+    text = f"{issuer_name}\n{context or ''}".lower()
+    non_vegan_keywords = [
+        "food",
+        "beverage",
+        "chocolate",
+        "confectionery",
+        "cocoa",
+        "meat",
+        "dairy",
+        "poultry",
+        "slaughter",
+        "livestock",
+        "leather",
+        "animal testing",
+        "pharma",
+        "pharmaceutical",
+        "biotech",
+        "biotechnology",
+        "drug",
+        "medicinal",
+        "vaccine",
+    ]
+    vegan_friendly_keywords = [
+        "bank",
+        "insurance",
+        "financial",
+        "software",
+        "construction",
+        "engineering",
+        "transport",
+        "automotive",
+        "mobility",
+        "logistics",
+        "vehicle",
+        "car",
+        "telecom",
+        "technology",
+        "industrial",
+        "utilities",
+    ]
+    if any(keyword in text for keyword in non_vegan_keywords):
+        return False
+    if any(keyword in text for keyword in vegan_friendly_keywords):
+        return True
+    return None
 
 
 def _merge_enrichment(existing: Optional[dict], updates: dict) -> dict:
@@ -149,10 +202,18 @@ def _process_issuer_job(job: dict) -> dict:
     profile_content = profile_result["text"]
     profile_parsed = extract_json(profile_content)
     vegan_friendly = _coerce_bool(profile_parsed.get("vegan_friendly"))
+    vegan_explanation = profile_parsed.get("vegan_explanation")
+    if vegan_friendly is None:
+        inferred = _infer_vegan_friendly(issuer_name, payload.get("context"))
+        if inferred is not None:
+            vegan_friendly = inferred
+            vegan_explanation = (
+                "Heuristic based on issuer context/industry keywords; no explicit statement found."
+            )
     profile_updates = {
         "summary_md": profile_parsed.get("summary_md"),
         "vegan_friendly": vegan_friendly,
-        "vegan_explanation": profile_parsed.get("vegan_explanation"),
+        "vegan_explanation": vegan_explanation,
         "esg_summary": profile_parsed.get("esg_summary"),
     }
     merged_profile = _merge_enrichment(existing, profile_updates)
