@@ -11,7 +11,7 @@ def test_load_env_overrides_existing_env(tmp_path, monkeypatch):
     load_env(env_path)
 
     assert get_env("GEMINI_API_KEY") == "fromfile"
-    assert is_envfile_key("GEMINI_API_KEY") is True
+    assert is_envfile_key("GEMINI_API_KEY")
 
 
 def test_load_env_sets_marker_for_new_key(tmp_path, monkeypatch):
@@ -22,4 +22,4 @@ def test_load_env_sets_marker_for_new_key(tmp_path, monkeypatch):
     load_env(env_path)
 
     assert get_env("OPENROUTER_API_KEY") == "router"
-    assert is_envfile_key("OPENROUTER_API_KEY") is True
+    assert is_envfile_key("OPENROUTER_API_KEY")
